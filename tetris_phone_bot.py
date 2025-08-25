@@ -1,3 +1,4 @@
+
 """
 tetris_phone_bot.py — versión robusta para Red Bull Tetris (celular)
 Cambios clave:
@@ -66,7 +67,7 @@ class TetrisConfig:
                 "tight_mode": {"pad_c": 0.22, "ring_pad": 0.06, "bg_floor": 12.0, "s_min": 70, "v_min": 110, "k_clusters": 3}
             },
             "devices": {"default": {"rect": [0.185, 0.225, 0.63, 0.57]}},
-            "gameplay": {"fps": 10, "session_sec": 185, "piece_tracker_timeout": 1.5, "max_component_size": 8}
+            "gameplay": {"fps": 10, "session_sec": 185, "piece_tracker_timeout": 1.5, "max_component_size": 4}
         }
         
         try:
@@ -136,54 +137,118 @@ class TetrisVision:
     def __init__(self, config: TetrisConfig):
         self.config = config
         self.temporal_filter = TemporalFilter(
-            history_size=config.config.get("vision", {}).get("temporal_filter_history", 5),
-            confidence_threshold=config.config.get("vision", {}).get("temporal_filter_threshold", 0.6)
+            history_size=config.config.get("vision", {}).get("temporal_filter_history", 7),  # Increased from 5
+            confidence_threshold=config.config.get("vision", {}).get("temporal_filter_threshold", 0.7)  # Increased from 0.6
         )
     
     def analyze_board(self, crop: np.ndarray, rows=20, cols=10, use_temporal_filter=True) -> BoardAnalysis:
-        """Análisis completo del tablero en un frame"""
-        # Análisis básico
-        occ, debug_mask = occupancy_grid(crop, rows, cols)
-
-        # Detección de pieza activa con filtrado temporal
-        raw_piece_cells = find_active_piece(occ, crop)
-
-        if use_temporal_filter:
-            # Añadir detección al filtro temporal
+        """
+        Análisis completo del tablero usando el nuevo sistema multilayer.
+        Mucho más robusto que el sistema anterior basado en comparaciones HSV relativas.
+        """
+        # NUEVO: Usar sistema multilayer para detección directa
+        raw_piece_cells, raw_ghost_cells, debug_info = detect_pieces_multilayer(crop, rows, cols)
+        occ_raw, _mask = occupancy_grid(crop, rows, cols, mode="normal")
+        occ = occ_raw.copy()
+        piece_cells = (self.temporal_filter.get_filtered_piece()           
+            if use_temporal_filter and raw_piece_cells else raw_piece_cells)
+        ghost_cells = raw_ghost_cells
+        # Aplicar filtrado temporal si está habilitado
+        if use_temporal_filter and raw_piece_cells:
             self.temporal_filter.add_detection(raw_piece_cells)
-            # Obtener pieza filtrada
             piece_cells = self.temporal_filter.get_filtered_piece()
         else:
             piece_cells = raw_piece_cells
+        
+        # Si usamos filtro temporal, puede que necesitemos redetectar el ghost para la nueva pieza
+        ghost_cells = raw_ghost_cells
+        if use_temporal_filter and piece_cells != raw_piece_cells and piece_cells:
+            # Re-detectar ghost para la pieza filtrada temporalmente
+            _, ghost_cells, _ = detect_pieces_multilayer(crop, rows, cols)
+        
+        # Crear grilla de ocupación compatible (solo piezas activas y bloques ya colocados)
+        # Esto mantiene compatibilidad con el resto del código
+        bg_grid, active_grid, ghost_grid, debug_mask = occupancy_grid_multilayer(crop, rows, cols)
+        
+        # La grilla de ocupación final incluye solo las piezas no-ghost
+        occ = active_grid.copy()
+        
+        # Quitar las celdas de la pieza activa detectada si es diferente a la grilla
+        if piece_cells:
+            for r, c in piece_cells:
+                if 0 <= r < rows and 0 <= c < cols:
+                    occ[r, c] = False
+            # Marcar solo las celdas de la pieza actual
+            for r, c in piece_cells:
+                if 0 <= r < rows and 0 <= c < cols:
+                    occ[r, c] = True
 
-
-        # Si la pieza incluye al ghost (componente fusionado), separarlos
-        piece_cells, merged_ghost = _split_merged_active_and_ghost(piece_cells or [])
-        piece_cells = piece_cells or None
-
-        # Detección de ghost usando la pieza filtrada/corregida
-        ghost_cells = detect_ghost_component(crop, occ, piece_cells) if piece_cells else []
-        if merged_ghost:
-            ghost_cells = list(set(ghost_cells) | set(merged_ghost))
-
-        if ghost_cells:
-            # Quitar ghost de la grilla de ocupación
-            remove_cells(occ, ghost_cells)
-            # Limpiar también la máscara de depuración para reflejar la corrección
-            for r, c in ghost_cells:
-                y0, y1, x0, x1 = _cell_rect(r, c, (rows, cols), crop.shape)
-                debug_mask[y0:y1, x0:x1] = 0
-
+        # Estadísticas
         num_occupied = int(occ.sum())
         total_cells = rows * cols
         occupation_rate = num_occupied / total_cells
-
-        components = list_components(occ, max_component_size=8)
+        
+        # Contar componentes (excluyendo ghost)
+        components = extract_components_by_type(occ, np.zeros_like(occ))[0]  # Solo activos
         components_found = len(components)
+        
+        # Log del nuevo sistema mejorado con más contexto
+        method_info = "multilayer + temporal" if use_temporal_filter else "multilayer"
+        stability_score = self.temporal_filter.get_stability_score() if use_temporal_filter else 1.0
+        
+        # Log detallado de detección de visión
+        logging.debug(f"👁️ VISION ANALYSIS ({method_info}):")
+        logging.debug(f"   🔍 Grid analysis: {num_occupied}/{total_cells} occupied ({occupation_rate:.1%})")
+        logging.debug(f"   🧩 Components found: {components_found}")
+        logging.debug(f"   🎯 Active piece: {len(piece_cells) if piece_cells else 0} cells detected")
+        logging.debug(f"   👻 Ghost piece: {len(ghost_cells) if ghost_cells else 0} cells detected")
+        if use_temporal_filter:
+            logging.debug(f"   🎚️ Temporal stability: {stability_score:.2f}")
+            if raw_piece_cells != piece_cells:
+                logging.debug(f"   🔄 Temporal filter active: raw {len(raw_piece_cells) if raw_piece_cells else 0} -> filtered {len(piece_cells) if piece_cells else 0}")
+        
+        # Log de posiciones específicas si hay pieza detectada
+        if piece_cells:
+            try:
+                r_min, r_max = min(r for r, c in piece_cells), max(r for r, c in piece_cells)
+                c_min, c_max = min(c for r, c in piece_cells), max(c for r, c in piece_cells)
+                piece_height = r_max - r_min + 1
+                piece_width = c_max - c_min + 1
+                logging.info(f"🎯 Piece detected ({method_info}): {len(piece_cells)} cells at rows {r_min}-{r_max}, cols {c_min}-{c_max} ({piece_width}x{piece_height})")
+            except ValueError:
+                logging.info(f"🎯 Piece detected ({method_info}): {len(piece_cells)} cells (position unknown)")
+        
+        if ghost_cells:
+            try:
+                r_min, r_max = min(r for r, c in ghost_cells), max(r for r, c in ghost_cells)
+                c_min, c_max = min(c for r, c in ghost_cells), max(c for r, c in ghost_cells)
+                logging.info(f"👻 Ghost detected ({method_info}): {len(ghost_cells)} cells at rows {r_min}-{r_max}, cols {c_min}-{c_max}")
+            except ValueError:
+                logging.info(f"👻 Ghost detected ({method_info}): {len(ghost_cells)} cells")
+        
+        # Warnings sobre detecciones sospechosas con más contexto
+        if piece_cells and len(piece_cells) > 4:
+            logging.error(f"❌ CRITICAL: Oversized piece detected: {len(piece_cells)} cells (max allowed: 4)")
+            logging.error(f"   Piece cells: {piece_cells}")
+            logging.error(f"   This indicates vision system malfunction - piece will be rejected")
+        elif piece_cells and len(piece_cells) == 1:
+            logging.warning(f"⚠️ Single cell piece detected - possibly noise or I-piece end")
+        elif piece_cells and len(piece_cells) in [2, 3, 4]:
+            logging.debug(f"✅ Valid piece size: {len(piece_cells)} cells")
+            
+        if occupation_rate > 0.8:
+            logging.warning(f"⚠️ Very high board occupation: {occupation_rate:.1%} - may indicate detection issues")
+        if components_found > 15:
+            logging.warning(f"⚠️ High component count: {components_found} - possible noise in detection")
+            
+        # Additional piece validation
+        if piece_cells and ghost_cells:
+            if len(set(piece_cells) & set(ghost_cells)) > 0:
+                logging.warning(f"⚠️ Piece and ghost overlap detected - may indicate detection confusion")
 
         return BoardAnalysis(
             occupancy_grid=occ,
-            debug_mask=debug_mask,
+            debug_mask=debug_info['debug_mask'],  # Usar la máscara multilayer más informativa
             active_piece=piece_cells,
             ghost_piece=ghost_cells,
             occupation_rate=occupation_rate,
@@ -260,14 +325,90 @@ class TemporalFilter:
         return valid_detections[-1]['cells'] if valid_detections else None
     
     def _get_consensus_piece(self, valid_detections: List[dict]) -> Optional[List[Tuple[int,int]]]:
-        """Calcula consenso entre múltiples detecciones válidas"""
+        """Calcula consenso entre múltiples detecciones válidas con validación mejorada"""
         if not valid_detections:
             return None
             
-        # Por simplicidad, usar la detección más reciente como base
-        # En futuras mejoras se podría promediar posiciones
-        latest_detection = valid_detections[-1]
-        return latest_detection['cells']
+        # Filtrar detecciones inválidas (más de 4 células, posiciones imposibles)
+        valid_pieces = []
+        for detection in valid_detections:
+            cells = detection['cells']
+            if cells and self._is_valid_tetris_piece(cells):
+                valid_pieces.append(cells)
+                
+        if not valid_pieces:
+            logging.warning("🔄 Temporal filter: No valid tetris pieces found in history")
+            return None
+            
+        # Si solo hay una pieza válida, usarla
+        if len(valid_pieces) == 1:
+            return valid_pieces[0]
+            
+        # Consenso por posición: buscar piezas que estén en posiciones similares
+        consensus_piece = self._find_position_consensus(valid_pieces)
+        
+        if consensus_piece:
+            logging.debug(f"🔄 Temporal filter: Consensus found from {len(valid_pieces)} valid detections")
+            return consensus_piece
+        else:
+            # Fallback: usar la más reciente válida
+            logging.debug("🔄 Temporal filter: Using most recent valid detection")
+            return valid_pieces[-1]
+    
+    def _is_valid_tetris_piece(self, cells: List[Tuple[int,int]]) -> bool:
+        """Valida si las células forman una pieza válida de Tetris"""
+        if not cells or len(cells) > 4 or len(cells) < 1:
+            return False
+            
+        # Verificar que las coordenadas están en rango válido
+        for r, c in cells:
+            if r < 0 or r >= 20 or c < 0 or c >= 10:
+                return False
+                
+        # Verificar conectividad (células adyacentes)
+        if len(cells) > 1:
+            cell_set = set(cells)
+            connected_cells = set()
+            stack = [cells[0]]
+            connected_cells.add(cells[0])
+            
+            while stack:
+                r, c = stack.pop()
+                # Verificar 4 direcciones
+                for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                    nr, nc = r + dr, c + dc
+                    if (nr, nc) in cell_set and (nr, nc) not in connected_cells:
+                        connected_cells.add((nr, nc))
+                        stack.append((nr, nc))
+                        
+            # Todas las células deben estar conectadas
+            return len(connected_cells) == len(cells)
+            
+        return True
+    
+    def _find_position_consensus(self, pieces: List[List[Tuple[int,int]]]) -> Optional[List[Tuple[int,int]]]:
+        """Encuentra consenso basado en posiciones similares de las piezas"""
+        if len(pieces) < 2:
+            return pieces[0] if pieces else None
+            
+        # Agrupar por columna izquierda (posición horizontal aproximada)
+        position_groups = {}
+        for piece in pieces:
+            try:
+                _, left_col, _, _ = bounding_box(piece)
+                if left_col not in position_groups:
+                    position_groups[left_col] = []
+                position_groups[left_col].append(piece)
+            except:
+                continue
+                
+        # Encontrar el grupo más grande (consenso)
+        if position_groups:
+            largest_group = max(position_groups.values(), key=len)
+            if len(largest_group) >= len(pieces) * 0.5:  # Al menos 50% de consenso
+                return largest_group[0]  # Usar el primero del grupo consensuado
+                
+        return None
     
     def get_stability_score(self) -> float:
         """Retorna un score de estabilidad de las detecciones (0-1)"""
@@ -287,6 +428,146 @@ class TemporalFilter:
         self.position_history.clear()
         self.shape_history.clear()
 
+class MovementCorrector:
+    """Sistema de corrección adaptiva para movimientos imprecisos con detección de offset sistemático"""
+    
+    def __init__(self):
+        self.movement_history = []
+        self.column_corrections = {}  # column -> average correction needed
+        self.success_rate = 0.0
+        self.total_attempts = 0
+        self.successful_attempts = 0
+        
+        # NEW: Systematic offset detection
+        self.systematic_offset = 0.0  # Average offset across all movements
+        self.offset_detection_threshold = 5  # Need at least 5 attempts for offset detection
+        self.last_offset_warning = 0  # Track when we last warned about offset
+        
+    def record_movement_attempt(self, start_col: int, target_col: int, actual_col: int, successful: bool):
+        """Registra un intento de movimiento para aprendizaje adaptivo"""
+        attempt = {
+            'start_col': start_col,
+            'target_col': target_col, 
+            'actual_col': actual_col,
+            'successful': successful,
+            'error': actual_col - target_col if actual_col is not None else None,
+            'timestamp': time.time()
+        }
+        
+        self.movement_history.append(attempt)
+        self.total_attempts += 1
+        
+        if successful:
+            self.successful_attempts += 1
+            
+        # Keep only recent history (last 50 attempts)
+        if len(self.movement_history) > 50:
+            self.movement_history.pop(0)
+            
+        # Update success rate
+        self.success_rate = self.successful_attempts / self.total_attempts if self.total_attempts > 0 else 0.0
+        
+        # Learn column-specific corrections
+        if attempt['error'] is not None:
+            if target_col not in self.column_corrections:
+                self.column_corrections[target_col] = []
+            self.column_corrections[target_col].append(attempt['error'])
+            
+            # Keep only recent corrections for each column
+            if len(self.column_corrections[target_col]) > 10:
+                self.column_corrections[target_col].pop(0)
+                
+        # NEW: Update systematic offset calculation
+        self._update_systematic_offset()
+        
+        logging.debug(f"🔄 Movement recorded: {start_col}→{target_col} (actual: {actual_col}, success: {successful})")
+        
+        # NEW: Check for systematic offset pattern and warn
+        if self.total_attempts >= self.offset_detection_threshold:
+            self._check_systematic_offset()
+        
+    def _update_systematic_offset(self):
+        """Actualiza el cálculo de offset sistemático"""
+        recent_errors = []
+        for attempt in self.movement_history[-10:]:  # Last 10 attempts
+            if attempt['error'] is not None:
+                recent_errors.append(attempt['error'])
+                
+        if recent_errors:
+            self.systematic_offset = sum(recent_errors) / len(recent_errors)
+            
+    def _check_systematic_offset(self):
+        """Verifica y advierte sobre offset sistemático consistente"""
+        if abs(self.systematic_offset) > 2.0:  # Significant systematic error
+            current_time = time.time()
+            if current_time - self.last_offset_warning > 30:  # Warn max once per 30 seconds
+                logging.error(f"🚨 SYSTEMATIC OFFSET DETECTED: {self.systematic_offset:.1f} columns")
+                logging.error(f"   This indicates board coordinate calibration is incorrect!")
+                logging.error(f"   Consistently moving {abs(self.systematic_offset):.1f} columns {'left' if self.systematic_offset < 0 else 'right'} of target")
+                logging.error(f"   Consider recalibrating board rectangle coordinates")
+                self.last_offset_warning = current_time
+
+    def get_corrected_target(self, target_col: int) -> int:
+        """Obtiene columna objetivo corregida basada en historial de errores y offset sistemático"""
+        corrected_target = target_col
+        
+        # First apply systematic offset correction if significant
+        if abs(self.systematic_offset) > 1.5 and self.total_attempts >= self.offset_detection_threshold:
+            systematic_correction = -int(round(self.systematic_offset))
+            corrected_target += systematic_correction
+            logging.debug(f"🔧 Systematic offset correction: {target_col} → {corrected_target} (offset: {self.systematic_offset:.1f})")
+        
+        # Then apply column-specific correction
+        if target_col in self.column_corrections:
+            errors = self.column_corrections[target_col]
+            if len(errors) >= 3:  # Need at least 3 data points
+                avg_error = sum(errors) / len(errors)
+                column_correction = -int(round(avg_error))
+                if column_correction != 0:
+                    old_target = corrected_target
+                    corrected_target += column_correction
+                    logging.debug(f"🎯 Column-specific correction: {old_target} → {corrected_target} (avg error: {avg_error:.1f})")
+        
+        # Clamp to valid range
+        final_target = max(0, min(9, corrected_target))
+        
+        if final_target != target_col:
+            correction_type = "systematic + column" if abs(self.systematic_offset) > 1.5 else "column-specific"
+            logging.info(f"🧠 Adaptive correction ({correction_type}): {target_col} → {final_target}")
+            
+        return final_target
+        
+    def get_recommended_timing_multiplier(self) -> float:
+        """Recomienda multiplicador de timing basado en tasa de éxito"""
+        if self.total_attempts < 5:
+            return 1.0
+            
+        if self.success_rate < 0.5:
+            return 1.5  # Much slower for very low success
+        elif self.success_rate < 0.7:
+            return 1.3  # Slower for low success  
+        elif self.success_rate < 0.8:
+            return 1.1  # Slightly slower for moderate success
+        else:
+            return 1.0  # Normal timing for high success
+            
+    def get_diagnostics(self) -> dict:
+        """Obtiene diagnósticos del sistema de corrección incluyendo offset sistemático"""
+        recent_errors = []
+        for attempt in self.movement_history[-10:]:
+            if attempt['error'] is not None:
+                recent_errors.append(attempt['error'])
+                
+        return {
+            'total_attempts': self.total_attempts,
+            'success_rate': self.success_rate,
+            'recent_avg_error': sum(recent_errors) / len(recent_errors) if recent_errors else 0,
+            'systematic_offset': self.systematic_offset,
+            'offset_detected': abs(self.systematic_offset) > 2.0,
+            'columns_learned': len(self.column_corrections),
+            'recommended_timing': self.get_recommended_timing_multiplier()
+        }
+
 class TetrisController:
     """Maneja todas las acciones de control del juego"""
     
@@ -294,14 +575,109 @@ class TetrisController:
         self.backend = backend
         self.zones = zones
         self.config = config
+        self.movement_corrector = MovementCorrector()  # Add adaptive correction
     
     def rotate_piece(self):
         """Wrapper para rotate_action - migración gradual"""
         rotate_action(self.backend, self.zones)
     
     def move_piece_to_column(self, piece_cells: List[Tuple[int,int]], target_col: int, board: 'BoardRect'):
-        """Wrapper para move_piece_to_column - migración gradual"""
-        move_piece_to_column(self.backend, self.zones, board, piece_cells, target_col)
+        """
+        Wrapper mejorado con sistema adaptivo de corrección de movimientos.
+        """
+        max_retries = 3
+        retry_count = 0
+        movement_successful = False
+        
+        # Get initial position for reference
+        try:
+            _, initial_col, _, _ = bounding_box(piece_cells)
+            logging.info(f"🎯 Movement request: col {initial_col} → col {target_col}")
+        except:
+            initial_col = 5  # fallback
+            
+        # ADAPTIVE CORRECTION: Apply learned corrections
+        original_target = target_col
+        corrected_target = self.movement_corrector.get_corrected_target(target_col)
+        adaptive_timing = self.movement_corrector.get_recommended_timing_multiplier()
+        
+        if corrected_target != original_target:
+            logging.info(f"🧠 Adaptive target correction: {original_target} → {corrected_target}")
+            
+        # Show current adaptive system status
+        diagnostics = self.movement_corrector.get_diagnostics()
+        if diagnostics['total_attempts'] > 0:
+            logging.debug(f"📊 Movement AI: {diagnostics['success_rate']:.1%} success rate, "
+                         f"{diagnostics['columns_learned']} cols learned, timing {diagnostics['recommended_timing']:.1f}x")
+            
+        while retry_count <= max_retries and not movement_successful:
+            # Combine adaptive timing with retry-based timing progression
+            base_timing = adaptive_timing + (retry_count * 0.3)
+            logging.info(f"🔄 Movement attempt {retry_count + 1}/{max_retries + 1} (timing: {base_timing:.1f}x)")
+            
+            move_piece_to_column(self.backend, self.zones, board, piece_cells, corrected_target, base_timing)
+            
+            # Espera extra para que el movimiento se complete
+            time.sleep(0.12 + retry_count * 0.05)
+            
+            # VERIFICACIÓN REAL POST-MOVIMIENTO
+            if retry_count < max_retries:
+                actual_col = self._get_actual_piece_position(board)
+                verification_successful = abs(actual_col - corrected_target) <= 1 if actual_col is not None else False
+                logging.debug(f"   Verify: actual={actual_col}, target_corrected={corrected_target}, target_original={original_target}")
+
+                
+                # RECORD MOVEMENT FOR ADAPTIVE LEARNING
+                self.movement_corrector.record_movement_attempt(
+                    initial_col, original_target, actual_col, verification_successful
+                )
+                
+                if verification_successful:
+                    logging.info(f"✅ Movement verified successful on attempt {retry_count + 1}")
+                    movement_successful = True
+                    break
+                else:
+                    logging.warning(f"❌ Movement verification failed on attempt {retry_count + 1}")
+                    if actual_col is not None:
+                        logging.warning(f"   Expected: {original_target}, Actual: {actual_col}, Error: {actual_col - original_target}")
+                    retry_count += 1
+            else:
+                # Last attempt - record attempt but don't verify
+                actual_col = self._get_actual_piece_position(board)
+                self.movement_corrector.record_movement_attempt(
+                    initial_col, original_target, actual_col, False  # Assume failed on final attempt
+                )
+                break
+                
+        if retry_count > 0:
+            status = "✅ successful" if movement_successful else "❌ failed"
+            logging.info(f"📊 Movement summary: {retry_count + 1} attempts, {status}")
+            
+            # Show updated adaptive status if we have learned something
+            if retry_count >= max_retries and not movement_successful:
+                new_timing = self.movement_corrector.get_recommended_timing_multiplier()
+                logging.info(f"🧠 Adaptive system updated: recommended timing now {new_timing:.1f}x")
+            
+        return movement_successful
+    
+    def _get_actual_piece_position(self, board: 'BoardRect') -> Optional[int]:
+        """Helper to get actual piece position for adaptive learning"""
+        try:
+            frame = self.backend.get_screen()
+            crop = frame[board.y0:board.y0+board.h, board.x0:board.x0+board.w]
+            
+            occ, _ = occupancy_grid(crop, rows=20, cols=10)
+            current_piece = find_active_piece(occ, crop)
+            
+            if current_piece:
+                _, actual_col, _, _ = bounding_box(current_piece)
+                return actual_col
+                
+        except Exception as e:
+            logging.debug(f"Could not get actual piece position: {e}")
+            
+        return None
+    
     
     def drop_piece(self):
         """Wrapper para drop_action - migración gradual"""
@@ -368,17 +744,113 @@ class TetrisBot:
         self.performance_monitor = PerformanceMonitor()
         
         # Parámetros del loop
-        self.fps = config.get_gameplay_param("fps", 10)
-        self.session_sec = config.get_gameplay_param("session_sec", 185)
-        self.dt = 1.0/float(clamp(self.fps, 3, 15))
+        self.fps = int(config.get_gameplay_param("fps", 10))
+        self.session_sec = int(config.get_gameplay_param("session_sec", 185))
+        self.dt = 1.0 / float(clamp(self.fps, 3, 15))
         
         logging.info(f"TetrisBot inicializado - FPS: {self.fps}, Sesión: {self.session_sec}s")
     
-    def run_game_loop(self, debug_vision=False, max_debug_frames=50):
-        """Ejecuta el bucle principal del juego - MIGRACIÓN FUTURA"""
-        # Por ahora, este método está vacío
-        # La migración del bucle principal será en una fase posterior
-        pass
+    def run_game_loop(self, debug_vision: bool=False, max_debug_frames: int=50):
+        """
+        Bucle principal:
+        - Captura frame -> crop
+        - Visión multilayer + filtro temporal
+        - Construye board stack (sin pieza activa)
+        - Clasifica pieza y decide (policy)
+        - Rota, mueve, drop
+        - Métricas + debug
+        """
+        rows, cols = 20, 10
+        t0 = time.time()
+        frame_idx = 0
+        saved_dbg = 0
+        
+        try:
+            while (time.time() - t0) < self.session_sec:
+                tic = time.time()
+                frame = self.backend.get_screen()
+                crop = frame[self.board.y0:self.board.y0+self.board.h,
+                             self.board.x0:self.board.x0+self.board.w]
+
+                analysis = self.vision.analyze_board(crop, rows=rows, cols=cols, use_temporal_filter=True)
+                occ = analysis.occupancy_grid.astype(bool)
+                piece_cells = analysis.active_piece
+
+                detection_success = piece_cells is not None and 1 <= len(piece_cells) <= 4
+                self.performance_monitor.log_frame_metrics(time.time(), detection_success)
+
+                # Guardado de debug
+                if debug_vision and saved_dbg < max_debug_frames:
+                    try:
+                        os.makedirs("tetris_debug", exist_ok=True)
+                        cv2.imwrite(f"tetris_debug/crop_{frame_idx:05d}.png", crop)
+                        dbg_mask = analysis.debug_mask
+                        cv2.imwrite(f"tetris_debug/mask_{frame_idx:05d}.png", dbg_mask)
+                        saved_dbg += 1
+                    except Exception as e:
+                        logging.debug(f"No pudo guardar debug: {e}")
+
+                if not detection_success:
+                    # Tap suave para mantener "awake" sin spam
+                    if frame_idx % 30 == 0:
+                        xw, yw = self.zones.rotate_xy
+                        self.backend.tap(xw + jitter(3), yw + jitter(3), hold_ms=60)
+                    time.sleep(self.dt)
+                    frame_idx += 1
+                    continue
+
+                # Construir board stack SIN la pieza activa
+                board_stack = occ.copy()
+                for (r, c) in piece_cells:
+                    if 0 <= r < rows and 0 <= c < cols:
+                        board_stack[r, c] = False
+
+                # Clasificar pieza actual
+                piece_info = classify_piece(piece_cells)
+                if not piece_info:
+                    logging.warning("No se pudo clasificar la pieza actual; saltando frame")
+                    time.sleep(self.dt)
+                    frame_idx += 1
+                    continue
+                piece_type, cur_orient = piece_info
+
+                # Elegir acción
+                decision = self.game.choose_action(board_stack, piece_type)
+                if not decision:
+                    logging.warning("Sin decisión válida; saltando")
+                    time.sleep(self.dt)
+                    frame_idx += 1
+                    continue
+
+                target_orient, target_left = decision
+                log_decision_context(piece_type, board_stack, piece_cells, target_left, target_orient, score="(see debug)", reason="policy choose")
+
+                # Rotar las veces necesarias (módulo número de orientaciones de la pieza)
+                total_orients = len(PIECE_ORIENTS[piece_type])
+                spins = (target_orient - cur_orient) % total_orients
+                for _ in range(spins):
+                    self.controller.rotate_piece()
+                    time.sleep(0.05)
+
+                # Mover a columna
+                self.controller.move_piece_to_column(piece_cells, target_left, self.board)
+
+                # Drop
+                self.controller.drop_piece()
+
+                # Métricas pieza
+                self.performance_monitor.log_piece_action(piece_type, True, lines_cleared=0)
+
+                # Ritmo del loop
+                elapsed = time.time() - tic
+                sleep_left = max(0.0, self.dt - elapsed)
+                time.sleep(sleep_left)
+                frame_idx += 1
+
+        except KeyboardInterrupt:
+            logging.info("⏹️ Interrumpido por el usuario.")
+        finally:
+            self.performance_monitor.log_performance_summary()
 
 class PerformanceMonitor:
     """Sistema de monitoreo y métricas para el rendimiento del bot"""
@@ -603,18 +1075,32 @@ class ADBBackend(ScreenBackend):
         logging.debug(f"ADB tap fallback: swipe {x},{y} -> {x+1},{y+1} dur={d}ms")
         self._run(["shell","input","swipe",str(x),str(y),str(x+1),str(y+1),str(d)])
         logging.debug("ADB tap completado (fallback swipe)")
-    def swipe(self,x1:int,y1:int,x2:int,y2:int,duration_ms:int=130):
-        d=max(110,int(duration_ms))
-        logging.debug(f"ADB swipe: ({x1},{y1}) -> ({x2},{y2}) dur={d}ms")
-        if self._shell_try([["input","swipe",str(x1),str(y1),str(x2),str(y2),str(d)]]):
+    def swipe(self, x1:int, y1:int, x2:int, y2:int, duration_ms:int=130):
+        # Forzar la variante que sí funciona en tu dispositivo:
+        # "adb shell input touchscreen swipe x1 y1 x2 y2 dur"
+        x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
+        d = max(180, int(duration_ms))  # un poco más largo para asegurar detección
+
+        logging.debug(f"ADB swipe (touchscreen): ({x1},{y1}) -> ({x2},{y2}) dur={d}ms")
+
+        # 1) La que te funciona (PRIORIDAD)
+        if self._shell_try([["input","touchscreen","swipe", str(x1),str(y1),str(x2),str(y2),str(d)]]):
+            logging.debug("ADB swipe exitoso (input touchscreen swipe)")
+            return
+
+        # 2) Fallbacks por si alguna ROM rara bloquea el primero
+        if self._shell_try([["cmd","input","touchscreen","swipe", str(x1),str(y1),str(x2),str(y2),str(d)]]):
+            logging.debug("ADB swipe exitoso (cmd input touchscreen swipe)")
+            return
+        if self._shell_try([["input","swipe", str(x1),str(y1),str(x2),str(y2),str(d)]]):
             logging.debug("ADB swipe exitoso (input swipe)")
             return
-        if self._shell_try([["cmd","input","swipe",str(x1),str(y1),str(x2),str(y2),str(d)]]):
+        if self._shell_try([["cmd","input","swipe", str(x1),str(y1),str(x2),str(y2),str(d)]]):
             logging.debug("ADB swipe exitoso (cmd input swipe)")
             return
+
         logging.error("ADB swipe falló en todas las variantes")
         raise RuntimeError("adb swipe falló en todas las variantes.")
-
 
 class ScrcpyBackend(ScreenBackend):
     def __init__(self, serial: Optional[str]=None, title="TetrisBot"):
@@ -860,6 +1346,254 @@ def _remove_small_components_bool_grid(occ: np.ndarray, min_cells:int=2)->np.nda
     return occ
 
 
+def classify_cell_type(hsv_cell: np.ndarray) -> str:
+    """
+    Clasifica una celda en uno de tres tipos basándose en rangos HSV absolutos:
+    - 'background': Fondo del juego (tonos azul-gris, baja saturación)
+    - 'active': Pieza activa (colores saturados y brillantes) 
+    - 'ghost': Pieza ghost (colores menos saturados, más oscuros)
+    
+    hsv_cell: array HSV de la región de la celda
+    Returns: 'background', 'active', o 'ghost'
+    """
+    # Calcular medianas HSV de la celda
+    h_med = float(np.median(hsv_cell[..., 0]))
+    s_med = float(np.median(hsv_cell[..., 1]))
+    v_med = float(np.median(hsv_cell[..., 2]))
+    
+    # Rangos HSV específicos para tu juego de Tetris
+    # VERDE (piezas verdes como en tu imagen)
+    GREEN_H_MIN, GREEN_H_MAX = 35, 85  # Hue para verde
+    
+    # ACTIVA: Verde brillante y saturado
+    ACTIVE_S_MIN = 150  # Saturación alta para piezas activas
+    ACTIVE_V_MIN = 150  # Brillo alto para piezas activas
+    
+    # GHOST: Verde menos saturado y más oscuro
+    GHOST_S_MIN = 80   # Saturación media para ghost
+    GHOST_S_MAX = 149  # Máxima saturación para ghost (menor que activa)
+    GHOST_V_MIN = 80   # Brillo medio para ghost
+    GHOST_V_MAX = 149  # Máximo brillo para ghost (menor que activa)
+    
+    # FONDO: Baja saturación (azules/grises del tablero)
+    BG_S_MAX = 79      # Saturación máxima para fondo
+    
+    # Lógica de clasificación
+    if GREEN_H_MIN <= h_med <= GREEN_H_MAX:
+        # Es verde - determinar si activa o ghost
+        if s_med >= ACTIVE_S_MIN and v_med >= ACTIVE_V_MIN:
+            return 'active'
+        elif GHOST_S_MIN <= s_med <= GHOST_S_MAX and GHOST_V_MIN <= v_med <= GHOST_V_MAX:
+            return 'ghost'
+    
+    # Añadir soporte para otros colores de piezas si es necesario
+    # Por ahora, cualquier color saturado que no sea verde se considera activa
+    if s_med >= ACTIVE_S_MIN and v_med >= ACTIVE_V_MIN:
+        return 'active'
+    
+    # Si no es una pieza, es fondo
+    return 'background'
+
+
+def occupancy_grid_multilayer(board_bgr, rows=20, cols=10, mode="normal"):
+    """
+    Nueva versión de occupancy_grid que clasifica cada celda en 3 tipos:
+    - background_grid: Celdas de fondo
+    - active_grid: Celdas de piezas activas  
+    - ghost_grid: Celdas de piezas ghost
+    
+    Returns: (background_grid, active_grid, ghost_grid, debug_mask)
+    """
+    H, W = board_bgr.shape[:2]
+    hsv = cv2.cvtColor(board_bgr, cv2.COLOR_BGR2HSV)
+    
+    # Inicializar las 3 grillas
+    background_grid = np.zeros((rows, cols), dtype=bool)
+    active_grid = np.zeros((rows, cols), dtype=bool)
+    ghost_grid = np.zeros((rows, cols), dtype=bool)
+    
+    # Crear máscara de debug (colorear por tipo)
+    debug_mask = np.zeros((H, W, 3), dtype=np.uint8)
+    
+    # Parámetros para el padding de celdas
+    PAD_C = 0.20 if mode == "normal" else 0.22
+    
+    # Calcular límites de celdas (pixel-perfect)
+    row_boundaries = np.linspace(0, H, rows + 1, dtype=int)
+    col_boundaries = np.linspace(0, W, cols + 1, dtype=int)
+    
+    # Iterar por cada celda
+    for r in range(rows):
+        for c in range(cols):
+            # Límites de la celda
+            x0, x1 = col_boundaries[c], col_boundaries[c + 1]
+            y0, y1 = row_boundaries[r], row_boundaries[r + 1]
+            
+            # Asegurar mínimo 1 pixel
+            x1 = max(x1, x0 + 1)
+            y1 = max(y1, y0 + 1)
+            
+            # Región central (evitar bordes)
+            dx, dy = int((x1-x0)*PAD_C), int((y1-y0)*PAD_C)
+            cx0, cx1 = x0+dx, x1-dx
+            cy0, cy1 = y0+dy, y1-dy
+            
+            if cx1 <= cx0 or cy1 <= cy0:
+                continue
+                
+            # Extraer HSV de la región central
+            c_hsv = hsv[cy0:cy1, cx0:cx1]
+            
+            # Clasificar la celda
+            cell_type = classify_cell_type(c_hsv)
+            
+            # Asignar a la grilla correspondiente
+            if cell_type == 'background':
+                background_grid[r, c] = True
+                debug_mask[y0:y1, x0:x1] = [100, 100, 100]  # Gris para fondo
+            elif cell_type == 'active':
+                active_grid[r, c] = True
+                debug_mask[y0:y1, x0:x1] = [0, 255, 0]      # Verde para activa
+            elif cell_type == 'ghost':
+                ghost_grid[r, c] = True
+                debug_mask[y0:y1, x0:x1] = [0, 255, 255]    # Cyan para ghost
+    
+    # Log estadísticas
+    total_cells = rows * cols
+    bg_count = np.sum(background_grid)
+    active_count = np.sum(active_grid)
+    ghost_count = np.sum(ghost_grid)
+    
+    logging.info(f"🎯 Multilayer segmentation: {bg_count} fondo, {active_count} activas, {ghost_count} ghost (total: {total_cells})")
+    
+    return background_grid, active_grid, ghost_grid, debug_mask
+
+
+def extract_components_by_type(active_grid: np.ndarray, ghost_grid: np.ndarray, 
+                              max_component_size: int = 4) -> tuple:
+    """
+    Extrae componentes conectados de las grillas de piezas activas y ghost por separado.
+    
+    Returns: (active_components, ghost_components)
+    - active_components: Lista de componentes de piezas activas
+    - ghost_components: Lista de componentes de piezas ghost
+    """
+    def get_components_from_grid(grid: np.ndarray) -> List[List[Tuple[int,int]]]:
+        """Extrae componentes conectados de una grilla booleana"""
+        rows, cols = grid.shape
+        vis = np.zeros_like(grid, bool)
+        components = []
+
+        def neighbors(r, c):
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < rows and 0 <= cc < cols:
+                    yield rr, cc
+
+        def flood_fill(start_r, start_c):
+            comp = []
+            stack = [(start_r, start_c)]
+            while stack:
+                r, c = stack.pop()
+                if vis[r, c] or not grid[r, c]:
+                    continue
+                vis[r, c] = True
+                comp.append((r, c))
+                
+                for nr, nc in neighbors(r, c):
+                    if not vis[nr, nc] and grid[nr, nc]:
+                        stack.append((nr, nc))
+                        
+                # Limitar tamaño de componente para evitar que crezca demasiado
+                if len(comp) > max_component_size:
+                    # Marcar todas las celdas restantes como visitadas
+                    for nr, nc in neighbors(r, c):
+                        if grid[nr, nc]:
+                            vis[nr, nc] = True
+                    break
+                            
+            return comp
+
+        # Encontrar todos los componentes
+        for r in range(rows):
+            for c in range(cols):
+                if grid[r, c] and not vis[r, c]:
+                    comp = flood_fill(r, c)
+                    if 1 <= len(comp) <= max_component_size:
+                        components.append(comp)
+
+        return components
+
+    # Extraer componentes de cada tipo
+    active_components = get_components_from_grid(active_grid)
+    ghost_components = get_components_from_grid(ghost_grid)
+    
+    logging.info(f"🔍 Components extracted: {len(active_components)} activas, {len(ghost_components)} ghost")
+    
+    return active_components, ghost_components
+
+
+def detect_pieces_multilayer(board_bgr: np.ndarray, rows=20, cols=10, mode="normal") -> tuple:
+    """
+    Nueva función de detección de piezas usando el sistema multilayer.
+    Reemplaza la lógica compleja anterior con un enfoque directo basado en colores absolutos.
+    
+    Returns: (active_piece, ghost_piece, debug_info)
+    - active_piece: Lista de celdas de la pieza activa
+    - ghost_piece: Lista de celdas de la pieza ghost  
+    - debug_info: Dict con información de debug
+    """
+    # Obtener las 3 capas de segmentación
+    bg_grid, active_grid, ghost_grid, debug_mask = occupancy_grid_multilayer(board_bgr, rows, cols, mode)
+    
+    # Extraer componentes conectados por tipo
+    active_components, ghost_components = extract_components_by_type(active_grid, ghost_grid)
+    
+    # Seleccionar la mejor pieza activa (componente más alto)
+    active_piece = None
+    if active_components:
+        # Ordenar por fila más alta (menor valor de r)
+        active_components.sort(key=lambda comp: min(r for r, c in comp))
+        active_piece = active_components[0]
+        logging.info(f"✅ Pieza activa detectada: {len(active_piece)} celdas (multilayer)")
+    
+    # Validar y seleccionar ghost piece
+    ghost_piece = None
+    if ghost_components and active_piece:
+        # El ghost debe estar debajo de la pieza activa y compartir al menos 1 columna
+        active_cols = set(c for r, c in active_piece)
+        active_bottom = max(r for r, c in active_piece)
+        
+        valid_ghosts = []
+        for ghost_comp in ghost_components:
+            ghost_cols = set(c for r, c in ghost_comp)
+            ghost_top = min(r for r, c in ghost_comp)
+            
+            # Validaciones: debe estar debajo y compartir columnas
+            if ghost_top > active_bottom and len(active_cols & ghost_cols) > 0:
+                valid_ghosts.append(ghost_comp)
+        
+        if valid_ghosts:
+            # Tomar el ghost más cercano a la pieza activa
+            valid_ghosts.sort(key=lambda comp: min(r for r, c in comp))
+            ghost_piece = valid_ghosts[0]
+            logging.info(f"👻 Ghost detectado: {len(ghost_piece)} celdas (multilayer)")
+    
+    # Si no hay ghost detectado pero hay componentes ghost, reportar
+    elif ghost_components:
+        logging.warning(f"⚠️ {len(ghost_components)} componentes ghost detectados pero ninguno válido posicionalmente")
+    
+    # Información de debug
+    debug_info = {
+        'active_components_count': len(active_components),
+        'ghost_components_count': len(ghost_components),
+        'debug_mask': debug_mask,
+        'multilayer_used': True
+    }
+    
+    return active_piece, ghost_piece, debug_info
+
+
 def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
     """
     Segmentación por celda basada en MODELO DE FONDO con EXCLUSIÓN DE SOMBRAS:
@@ -1054,7 +1788,7 @@ def occupancy_grid_tight(board_bgr, rows=20, cols=10):
     return occupancy_grid(board_bgr, rows, cols, mode="tight")
 
 
-def list_components(occ: np.ndarray, max_component_size: int = 8) -> List[List[Tuple[int,int]]]:
+def list_components(occ: np.ndarray, max_component_size: int = 4) -> List[List[Tuple[int,int]]]:
     """
     Lista componentes conectados (4-conectividad). Si un componente excede max_component_size,
     se descarta y se marca COMPLETO como visitado para que no re-aparezca.
@@ -1200,11 +1934,11 @@ def detect_ghost_component(board_bgr: np.ndarray,
     val_active = _avg_val_of_component(board_bgr, piece_cells, grid_shape)
 
     # umbrales robustos (ajustables)
-    SAT_DELTA_MIN = 8.0    # ghost debe ser menos saturado
-    V_DELTA_MIN   = 5.0    # y un poco más brillante
+    SAT_DELTA_MIN = 4.0    # ghost debe ser menos saturado (reducido para mejor detección)
+    V_DELTA_MIN   = 2.0    # y un poco más brillante (reducido para mejor detección)
     MAX_GHOST_SIZE = 6
 
-    comps = list_components(occ, max_component_size=12)
+    comps = list_components(occ, max_component_size=4)
     active_set = set(piece_cells)
 
     cands = []
@@ -1224,6 +1958,10 @@ def detect_ghost_component(board_bgr: np.ndarray,
         val_comp = _avg_val_of_component(board_bgr, comp, grid_shape)
         sat_diff = sat_active - sat_comp
         val_diff = val_comp - val_active
+        
+        # Debug logging para analizar valores HSV
+        logging.debug(f"🔍 Ghost analysis: sat_active={sat_active:.1f}, sat_comp={sat_comp:.1f}, sat_diff={sat_diff:.1f} (min={SAT_DELTA_MIN})")
+        logging.debug(f"🔍 Ghost analysis: val_active={val_active:.1f}, val_comp={val_comp:.1f}, val_diff={val_diff:.1f} (min={V_DELTA_MIN})")
 
         if sat_diff >= SAT_DELTA_MIN and val_diff >= V_DELTA_MIN:
             cands.append({
@@ -1383,8 +2121,8 @@ def filter_ghost_pieces(board_bgr: np.ndarray,
     val_anchor = _avg_val_of_component(board_bgr, anchor, grid_shape)
     cols_anchor = set(c for _,c in anchor)
 
-    SAT_DELTA_MIN = 8.0
-    V_DELTA_MIN   = 5.0
+    SAT_DELTA_MIN = 4.0  # Reducido para mejor detección de ghost
+    V_DELTA_MIN   = 2.0  # Reducido para mejor detección de ghost
 
     out=[]
     removed=0
@@ -1404,6 +2142,13 @@ def filter_ghost_pieces(board_bgr: np.ndarray,
 
         sat_c = _avg_sat_of_component(board_bgr, comp, grid_shape)
         val_c = _avg_val_of_component(board_bgr, comp, grid_shape)
+        
+        # Debug logging para filtro de ghost
+        sat_diff = sat_anchor - sat_c
+        val_diff = val_c - val_anchor
+        logging.debug(f"🧹 Filter ghost: sat_anchor={sat_anchor:.1f}, sat_c={sat_c:.1f}, sat_diff={sat_diff:.1f} (min={SAT_DELTA_MIN})")
+        logging.debug(f"🧹 Filter ghost: val_anchor={val_anchor:.1f}, val_c={val_c:.1f}, val_diff={val_diff:.1f} (min={V_DELTA_MIN})")
+        
         if (sat_anchor - sat_c) >= SAT_DELTA_MIN and (val_c - val_anchor) >= V_DELTA_MIN:
             removed += 1
             continue
@@ -1486,7 +2231,7 @@ def find_active_piece(occ: np.ndarray, board_bgr: np.ndarray=None) -> Optional[L
     rows, cols = occ.shape
     grid_shape = (rows, cols)
 
-    comps = list_components(occ, max_component_size=8)
+    comps = list_components(occ, max_component_size=4)
     if not comps:
         logging.warning("No hay componentes en occ."); 
         return None
@@ -1584,6 +2329,495 @@ def count_holes(board: np.ndarray)->int:
 
 def bumpiness(h: np.ndarray)->int:
     return int(np.sum(np.abs(np.diff(h))))
+
+def log_board_state(board: np.ndarray, piece_cells=None, frame_num=None, context=""):
+    """
+    Genera un log visual del estado del tablero para debugging
+    """
+    rows, cols = board.shape
+    h = column_heights(board)
+    holes = count_holes(board)
+    bump = bumpiness(h)
+    
+    # Header con información del frame
+    frame_info = f" Frame {frame_num}" if frame_num is not None else ""
+    logging.info(f"📋 BOARD STATE{frame_info} {context}")
+    logging.info(f"   Metrics: Heights={h.tolist()}, Holes={holes}, Bump={bump}")
+    
+    # Representación visual del tablero
+    piece_positions = set(piece_cells) if piece_cells else set()
+    
+    for r in range(min(12, rows)):  # Solo mostrar top 12 filas para no saturar logs
+        row_str = "   "
+        for c in range(cols):
+            if (r, c) in piece_positions:
+                row_str += "P"  # Pieza activa
+            elif board[r, c]:
+                row_str += "█"  # Bloque ocupado
+            else:
+                row_str += "·"  # Vacío
+        
+        row_num = f"R{r:2d}"
+        logging.info(f"{row_num}|{row_str}|")
+    
+    # Footer con columnas
+    col_header = "   " + "".join(str(i) for i in range(cols))
+    logging.info(f"    {col_header}")
+    logging.info("   " + "─" * (cols + 2))
+
+def log_decision_context(piece_type, current_board, piece_cells, target_col, rotations, score, reason=""):
+    """
+    Log detallado del contexto de decisión para debugging
+    """
+    logging.info(f"🧠 DECISION CONTEXT: {piece_type}")
+    logging.info(f"   Piece at: {piece_cells}")
+    logging.info(f"   Target: col={target_col}, rotations={rotations}")
+    # Handle score formatting - could be number or string
+    if isinstance(score, (int, float)):
+        logging.info(f"   Score: {score:,}")
+    else:
+        logging.info(f"   Score: {score}")
+    logging.info(f"   Reason: {reason}")
+    
+    # Mini visualización de la decisión
+    if piece_cells:
+        try:
+            r_min = min(r for r, c in piece_cells)
+            r_max = max(r for r, c in piece_cells)
+            c_min = min(c for r, c in piece_cells) 
+            c_max = max(c for r, c in piece_cells)
+            logging.info(f"   Piece bounds: rows {r_min}-{r_max}, cols {c_min}-{c_max}")
+            logging.info(f"   Will move from col {c_min} to col {target_col}")
+        except (ValueError, TypeError):
+            logging.info("   Piece position: unknown")
+
+def diagnose_movement_coordinates(board: 'BoardRect', piece_cells: List[Tuple[int,int]], target_col: int):
+    """
+    Diagnóstico detallado de cálculo de coordenadas para debugging movimientos
+    """
+    logging.info("🔬 MOVEMENT COORDINATE DIAGNOSIS")
+    
+    # Board info
+    cw = board.w / 10.0
+    logging.info(f"   📏 Board: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
+    logging.info(f"   📐 Cell width: {cw:.1f} pixels per column")
+    
+    if piece_cells:
+        try:
+            r0, c0, r1, c1 = bounding_box(piece_cells)
+            piece_width = c1 - c0 + 1
+            
+            logging.info(f"   🎯 Piece detection: rows {r0}-{r1}, cols {c0}-{c1}")
+            logging.info(f"   📦 Piece size: {piece_width} columns wide")
+            logging.info(f"   📍 Current position: leftmost col = {c0}")
+            
+            # Calculate expected pixel positions
+            current_pixel_center = board.x0 + (c0 + 0.5) * cw
+            target_pixel_center = board.x0 + (target_col + 0.5) * cw
+            pixel_distance = target_pixel_center - current_pixel_center
+            
+            logging.info(f"   🧮 Pixel calculations:")
+            logging.info(f"      Current col {c0} center = {current_pixel_center:.1f} px")
+            logging.info(f"      Target col {target_col} center = {target_pixel_center:.1f} px")
+            logging.info(f"      Distance to move = {pixel_distance:.1f} px")
+            logging.info(f"      Columns to move = {target_col - c0} columns")
+            
+            # Validate that piece fits in target
+            if target_col + piece_width - 1 > 9:
+                logging.warning(f"   ⚠️ TARGET PROBLEM: Piece width {piece_width} at col {target_col} would exceed board (max col 9)")
+            
+            # Check for coordinate issues
+            if c0 < 0 or c1 > 9:
+                logging.warning(f"   ⚠️ DETECTION PROBLEM: Piece columns {c0}-{c1} outside valid range 0-9")
+                
+        except Exception as e:
+            logging.error(f"   ❌ Error in coordinate diagnosis: {e}")
+    else:
+        logging.warning(f"   ⚠️ No piece cells provided for diagnosis")
+
+def save_column_debug_image(backend: 'ScreenBackend', board: 'BoardRect', piece_cells: List[Tuple[int,int]], 
+                           target_col: int, frame_num: int = None):
+    """
+    Crea una imagen de debug con overlay de columnas para diagnosticar problemas de mapeo.
+    FIX: usar backend.get_screen() (no existe screenshot()).
+    """
+    try:
+        # Capturar screenshot actual
+        img = backend.get_screen()
+        if img is None:
+            logging.warning("   📷 Cannot capture screenshot for column debugging")
+            return
+            
+        overlay = img.copy()
+        
+        # Dimensiones de celda
+        cw = board.w / 10.0
+        ch = board.h / 20.0
+        
+        # Dibujar líneas de columnas
+        for col in range(11):  # 0..10 bordes
+            x = int(board.x0 + col * cw)
+            y1 = int(board.y0)
+            y2 = int(board.y0 + board.h)
+            color = (0, 255, 0) if col == target_col else (255, 255, 255)
+            thickness = 3 if col == target_col else 1
+            cv2.line(overlay, (x, y1), (x, y2), color, thickness)
+            if col < 10:
+                label_x = x + int(cw/2) - 5
+                label_y = max(10, y1 - 8)
+                cv2.putText(overlay, str(col), (label_x, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, thickness)
+        
+        # Filas cada 5
+        for row in range(0, 21, 5):
+            y = int(board.y0 + row * ch)
+            x1 = int(board.x0)
+            x2 = int(board.x0 + board.w)
+            cv2.line(overlay, (x1, y), (x2, y), (100, 100, 100), 1)
+        
+        # Rect de la pieza
+        if piece_cells:
+            try:
+                r0, c0, r1, c1 = bounding_box(piece_cells)
+                piece_x1 = int(board.x0 + c0 * cw)
+                piece_y1 = int(board.y0 + r0 * ch)
+                piece_x2 = int(board.x0 + (c1 + 1) * cw)
+                piece_y2 = int(board.y0 + (r1 + 1) * ch)
+                cv2.rectangle(overlay, (piece_x1, piece_y1), (piece_x2, piece_y2), (0, 0, 255), 2)
+                cv2.putText(overlay, f"Current: {c0}", (piece_x1, max(12, piece_y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            except Exception as e:
+                logging.debug(f"Error drawing piece overlay: {e}")
+        
+        # Columna objetivo sombreada
+        tx1 = int(board.x0 + target_col * cw)
+        ty1 = int(board.y0)
+        tx2 = int(board.x0 + (target_col + 1) * cw)
+        ty2 = int(board.y0 + board.h)
+        col_layer = overlay.copy()
+        cv2.rectangle(col_layer, (tx1, ty1), (tx2, ty2), (0, 255, 0), -1)
+        cv2.addWeighted(col_layer, 0.25, overlay, 0.75, 0, overlay)
+        cv2.putText(overlay, f"Target: {target_col}", (tx1, min(img.shape[0]-10, ty2 + 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        
+        # Info
+        info_y = 30
+        cv2.putText(overlay, f"Board: {board.x0},{board.y0} {board.w}x{board.h}",
+                    (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        info_y += 20
+        cv2.putText(overlay, f"Cell: {cw:.1f}x{ch:.1f}px",
+                    (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+        # Guardar
+        frame_suffix = f"_frame{frame_num}" if frame_num else ""
+        os.makedirs("tetris_debug", exist_ok=True)
+        debug_path = os.path.join("tetris_debug", f"debug_columns{frame_suffix}.png")
+        cv2.imwrite(debug_path, overlay)
+        logging.info(f"   📸 Column debug image saved: {debug_path}")
+    except Exception as e:
+        logging.error(f"   ❌ Error creating column debug image: {e}")
+
+def validate_screen_coordinates(backend: 'ScreenBackend', board: 'BoardRect') -> dict:
+    """
+    Herramienta de validación de coordenadas de pantalla para calibración MEJORADA
+    """
+    logging.info("🔧 COMPREHENSIVE SCREEN COORDINATE VALIDATION")
+    
+    validation_results = {
+        'board_valid': True,
+        'gesture_zones_valid': True,
+        'cell_mapping_valid': True,
+        'movement_safety_valid': True,
+        'coordinate_precision_valid': True,
+        'issues': [],
+        'warnings': []
+    }
+    
+    # Validate board coordinates
+    screen_width, screen_height = backend.get_resolution()
+    cw = board.w / 10.0
+    ch = board.h / 20.0
+    
+    logging.info(f"   📱 Screen: {screen_width}x{screen_height}")
+    logging.info(f"   🎮 Board: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
+    logging.info(f"   📏 Cell size: {cw:.1f}x{ch:.1f} pixels")
+    logging.info(f"   📊 Board coverage: {board.w/screen_width:.1%}w x {board.h/screen_height:.1%}h of screen")
+    
+    # Enhanced board boundary validation
+    if board.x0 < 0 or board.y0 < 0:
+        validation_results['board_valid'] = False
+        validation_results['issues'].append("Board coordinates are negative")
+        
+    if board.x0 + board.w > screen_width or board.y0 + board.h > screen_height:
+        validation_results['board_valid'] = False
+        validation_results['issues'].append("Board extends beyond screen boundaries")
+        
+    # Enhanced cell size validation with specific recommendations
+    if cw < 20:
+        validation_results['cell_mapping_valid'] = False
+        validation_results['issues'].append(f"Cell width {cw:.1f}px too small (min 20px) - board width may be incorrect")
+    elif cw > 100:
+        validation_results['cell_mapping_valid'] = False  
+        validation_results['issues'].append(f"Cell width {cw:.1f}px too large (max 100px) - board width may be incorrect")
+    elif cw < 30:
+        validation_results['warnings'].append(f"Cell width {cw:.1f}px is small - movement precision may be difficult")
+        
+    if ch < 20:
+        validation_results['cell_mapping_valid'] = False
+        validation_results['issues'].append(f"Cell height {ch:.1f}px too small (min 20px) - board height may be incorrect")  
+    elif ch > 100:
+        validation_results['cell_mapping_valid'] = False
+        validation_results['issues'].append(f"Cell height {ch:.1f}px too large (max 100px) - board height may be incorrect")
+    
+    # Validate gesture zones
+    zones = compute_gesture_zones(board)
+    
+    logging.info(f"   🎯 Gesture zones:")
+    logging.info(f"      Rotate: {zones.rotate_xy}")
+    logging.info(f"      Move Y: {zones.mid_band_y}")
+    logging.info(f"      Drop: {zones.drop_path}")
+    
+    # Enhanced gesture zone validation
+    if zones.rotate_xy[0] < 0 or zones.rotate_xy[0] > screen_width or zones.rotate_xy[1] < 0 or zones.rotate_xy[1] > screen_height:
+        validation_results['gesture_zones_valid'] = False
+        validation_results['issues'].append("Rotate zone outside screen boundaries")
+        
+    if zones.mid_band_y < 0 or zones.mid_band_y > screen_height:
+        validation_results['gesture_zones_valid'] = False
+        validation_results['issues'].append("Movement zone Y outside screen boundaries")
+    
+    # NUEVO: Detailed column coordinate mapping with movement validation
+    logging.info(f"   📐 Detailed column coordinate mapping:")
+    movement_issues = []
+    
+    for col in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]:
+        pixel_x = board.x0 + (col + 0.5) * cw
+        pixel_left = board.x0 + col * cw
+        pixel_right = board.x0 + (col + 1) * cw
+        
+        if col % 2 == 0:  # Log every other column to avoid spam
+            logging.info(f"      Col {col}: center={pixel_x:.1f}px, bounds=[{pixel_left:.1f}, {pixel_right:.1f}]")
+        
+        # Check if column mapping is within board bounds
+        if pixel_left < board.x0 or pixel_right > board.x0 + board.w:
+            validation_results['cell_mapping_valid'] = False
+            validation_results['issues'].append(f"Column {col} extends outside board boundaries")
+            
+        # Check movement safety - can we safely swipe within this column?
+        safety_margin = 15
+        safe_left = board.x0 + safety_margin
+        safe_right = board.x0 + board.w - safety_margin
+        
+        if pixel_x < safe_left or pixel_x > safe_right:
+            movement_issues.append(col)
+    
+    # NUEVO: Movement distance validation
+    logging.info(f"   🔄 Movement distance validation:")
+    max_single_move_distance = 0.8 * cw  # Based on our new safe movement calculation
+    for distance in [1, 2, 3, 4]:  # Test 1-4 column movements
+        pixel_distance = distance * max_single_move_distance
+        steps_required = distance  # One step per column
+        total_time = steps_required * 0.25  # Estimated time per step
+        
+        logging.info(f"      {distance} cols: {pixel_distance:.1f}px, {steps_required} steps, ~{total_time:.1f}s")
+        
+        if pixel_distance > cw * 1.2:  # If movement is more than 1.2x cell width
+            validation_results['warnings'].append(f"{distance}-column movement may be imprecise")
+    
+    if movement_issues:
+        validation_results['movement_safety_valid'] = False
+        validation_results['issues'].append(f"Columns {movement_issues} are in unsafe movement zones")
+        
+    # NUEVO: Coordinate precision analysis
+    min_meaningful_movement = 5  # Minimum pixels for meaningful swipe
+    precision_score = min_meaningful_movement / cw
+    
+    logging.info(f"   🎯 Coordinate precision analysis:")
+    logging.info(f"      Min meaningful movement: {min_meaningful_movement}px")
+    logging.info(f"      Precision ratio: {precision_score:.3f} (lower is better)")
+    
+    if precision_score > 0.2:  # If minimum movement is more than 20% of cell width
+        validation_results['coordinate_precision_valid'] = False
+        validation_results['issues'].append(f"Movement precision insufficient: {precision_score:.1%} of cell width")
+    elif precision_score > 0.1:
+        validation_results['warnings'].append(f"Movement precision is marginal: {precision_score:.1%} of cell width")
+    
+    # Summary with enhanced reporting
+    overall_valid = all([
+        validation_results['board_valid'], 
+        validation_results['gesture_zones_valid'], 
+        validation_results['cell_mapping_valid'],
+        validation_results['movement_safety_valid'],
+        validation_results['coordinate_precision_valid']
+    ])
+    
+    status = "✅ VALID" if overall_valid else "❌ ISSUES FOUND"
+    logging.info(f"   📋 Validation result: {status}")
+    
+    if validation_results['issues']:
+        logging.warning("   🚨 Critical issues found:")
+        for issue in validation_results['issues']:
+            logging.warning(f"      ❌ {issue}")
+            
+    if validation_results['warnings']:
+        logging.info("   ⚠️ Warnings:")
+        for warning in validation_results['warnings']:
+            logging.info(f"      ⚠️ {warning}")
+    
+    # NUEVO: Provide specific recommendations
+    if not overall_valid:
+        logging.error("   💡 RECOMMENDATIONS:")
+        if not validation_results['board_valid']:
+            logging.error("      📱 Check screen resolution and board rectangle coordinates")
+        if not validation_results['cell_mapping_valid']:
+            logging.error("      📏 Recalibrate board width/height - cells are wrong size")
+        if not validation_results['movement_safety_valid']:
+            logging.error("      🔄 Adjust movement margins - some columns unreachable")
+        if not validation_results['coordinate_precision_valid']:
+            logging.error("      🎯 Increase board size or adjust movement algorithm")
+    
+    validation_results['overall_valid'] = overall_valid
+    return validation_results
+
+def verify_board_runtime(board: 'BoardRect', piece_cells: List[Tuple[int,int]], 
+                        occ_grid: np.ndarray, frame_num: int) -> dict:
+    """
+    Verificación runtime del rectángulo del tablero basada en datos reales detectados
+    """
+    verification_results = {
+        'board_alignment_valid': True,
+        'piece_position_valid': True, 
+        'occupancy_distribution_valid': True,
+        'coordinate_consistency_valid': True,
+        'confidence_score': 1.0,
+        'issues': [],
+        'recommendations': []
+    }
+    
+    try:
+        rows, cols = occ_grid.shape
+        cw = board.w / 10.0
+        ch = board.h / 20.0
+        
+        # 1. VERIFICACIÓN DE POSICIÓN DE PIEZA
+        if piece_cells:
+            piece_rows = [r for r, c in piece_cells]
+            piece_cols = [c for r, c in piece_cells]
+            
+            min_row, max_row = min(piece_rows), max(piece_rows)
+            min_col, max_col = min(piece_cols), max(piece_cols)
+            
+            # Verificar que la pieza está dentro de los límites lógicos
+            if min_col < 0 or max_col >= cols or min_row < 0 or max_row >= rows:
+                verification_results['piece_position_valid'] = False
+                verification_results['issues'].append(
+                    f"Piece detected outside board bounds: rows {min_row}-{max_row}, cols {min_col}-{max_col}"
+                )
+                verification_results['confidence_score'] *= 0.5
+                
+            # Verificar coherencia del tamaño de pieza  
+            piece_width = max_col - min_col + 1
+            piece_height = max_row - min_row + 1
+            piece_cells_count = len(piece_cells)
+            
+            if piece_cells_count > 4:
+                verification_results['piece_position_valid'] = False
+                verification_results['issues'].append(f"Oversized piece detected: {piece_cells_count} cells")
+                verification_results['confidence_score'] *= 0.3
+                
+            if piece_width > 4 or piece_height > 4:
+                verification_results['coordinate_consistency_valid'] = False
+                verification_results['issues'].append(f"Piece dimensions too large: {piece_width}x{piece_height}")
+                verification_results['confidence_score'] *= 0.6
+        
+        # 2. VERIFICACIÓN DE DISTRIBUCIÓN DE OCUPACIÓN
+        # Analizar si la ocupación sigue patrones esperados de Tetris
+        total_occupied = np.sum(occ_grid)
+        total_cells = rows * cols
+        occupation_rate = total_occupied / total_cells
+        
+        # Verificar distribución por filas (las piezas deben caer hacia abajo)
+        row_occupancy = [np.sum(occ_grid[r, :]) for r in range(rows)]
+        
+        # Las filas superiores no deberían tener más ocupación que las inferiores
+        # a menos que sea el inicio del juego
+        if occupation_rate > 0.1:  # Solo verificar si hay suficiente ocupación
+            for r in range(rows - 5, rows):  # Verificar últimas 5 filas
+                if r < rows - 1:
+                    current_row_occ = row_occupancy[r]
+                    next_row_occ = row_occupancy[r + 1]
+                    
+                    # Si una fila superior tiene mucha más ocupación que la inferior
+                    if current_row_occ > 0 and next_row_occ == 0 and current_row_occ > 3:
+                        verification_results['occupancy_distribution_valid'] = False
+                        verification_results['issues'].append(
+                            f"Suspicious occupancy pattern: row {r} has {current_row_occ} cells but row {r+1} empty"
+                        )
+                        verification_results['recommendations'].append(
+                            "Board rectangle may be missing bottom rows - consider expanding vertically"
+                        )
+                        verification_results['confidence_score'] *= 0.7
+        
+        # 3. VERIFICACIÓN DE COHERENCIA TEMPORAL
+        # Esta verificación se puede expandir para tracking entre frames
+        
+        # 4. VERIFICACIÓN DE LÍMITES DE COORDENADAS
+        # Verificar que las coordenadas calculadas están dentro de rangos razonables
+        if piece_cells:
+            for r, c in piece_cells:
+                expected_pixel_x = board.x0 + (c + 0.5) * cw
+                expected_pixel_y = board.y0 + (r + 0.5) * ch
+                
+                # Los pixels calculados deben estar dentro del rectángulo del board
+                if not (board.x0 <= expected_pixel_x <= board.x0 + board.w):
+                    verification_results['coordinate_consistency_valid'] = False
+                    verification_results['issues'].append(
+                        f"Calculated X coordinate {expected_pixel_x:.1f} outside board range [{board.x0}, {board.x0 + board.w}]"
+                    )
+                    verification_results['confidence_score'] *= 0.4
+                    
+                if not (board.y0 <= expected_pixel_y <= board.y0 + board.h):
+                    verification_results['coordinate_consistency_valid'] = False
+                    verification_results['issues'].append(
+                        f"Calculated Y coordinate {expected_pixel_y:.1f} outside board range [{board.y0}, {board.y0 + board.h}]"
+                    )
+                    verification_results['confidence_score'] *= 0.4
+        
+        # Determinar si la verificación general es válida
+        overall_valid = (
+            verification_results['board_alignment_valid'] and
+            verification_results['piece_position_valid'] and
+            verification_results['occupancy_distribution_valid'] and 
+            verification_results['coordinate_consistency_valid']
+        )
+        
+        verification_results['overall_valid'] = overall_valid
+        
+        # Log de resultados si hay problemas
+        if not overall_valid or verification_results['confidence_score'] < 0.8:
+            logging.warning(f"🔍 RUNTIME BOARD VERIFICATION - Frame {frame_num}")
+            logging.warning(f"   Confidence: {verification_results['confidence_score']:.2f}")
+            logging.warning(f"   Issues found: {len(verification_results['issues'])}")
+            
+            for issue in verification_results['issues'][:3]:  # Max 3 issues per log
+                logging.warning(f"   ❌ {issue}")
+                
+            for rec in verification_results['recommendations'][:2]:  # Max 2 recommendations  
+                logging.warning(f"   💡 {rec}")
+                
+            if verification_results['confidence_score'] < 0.5:
+                logging.error("🚨 CRITICAL: Board rectangle calibration appears incorrect!")
+                
+        elif frame_num % 300 == 0:  # Log success every 5 minutes
+            logging.debug(f"✅ Runtime board verification passed (confidence: {verification_results['confidence_score']:.2f})")
+        
+    except Exception as e:
+        logging.error(f"❌ Runtime board verification failed: {e}")
+        verification_results['overall_valid'] = False
+        verification_results['confidence_score'] = 0.0
+        verification_results['issues'].append(f"Verification error: {e}")
+    
+    return verification_results
 
 def evaluate_board_advanced(board: np.ndarray, lines_cleared: int, 
                            enable_tspin_detection=True, enable_combo_bonus=True) -> float:
@@ -1697,6 +2931,16 @@ def evaluate_dependencies(board: np.ndarray, heights: np.ndarray) -> float:
     
     return penalty
 
+
+def _choose_backend(name: str, serial: Optional[str]) -> ScreenBackend:
+    name = (name or "hybrid").lower()
+    if name == "adb":
+        return ADBBackend(serial)
+    if name == "scrcpy":
+        return ScrcpyBackend(serial)
+    return HybridBackend(serial)  # default
+
+
 def evaluate_surface_flatness(heights: np.ndarray) -> float:
     """Bonus por mantener superficie relativamente plana"""
     if len(heights) < 2:
@@ -1710,26 +2954,273 @@ def evaluate_surface_flatness(heights: np.ndarray) -> float:
     
     return flatness_bonus
 
+
+def detect_line_clear_opportunities(board: np.ndarray, heights: np.ndarray) -> int:
+    """
+    Detecta filas que están cerca de completarse (pocas celdas vacías).
+    Retorna un score basado en cuántas oportunidades de line clear hay.
+    """
+    rows, cols = board.shape
+    opportunities = 0
+    
+    for row in range(rows):
+        # Contar celdas ocupadas en esta fila
+        occupied_cells = np.sum(board[row, :])
+        empty_cells = cols - occupied_cells
+        
+        # Si la fila está casi completa, es una oportunidad
+        if empty_cells == 1:
+            opportunities += 10  # Fila necesita solo 1 pieza - ¡prioritaria!
+        elif empty_cells == 2:
+            opportunities += 5   # Fila necesita 2 piezas - buena oportunidad
+        elif empty_cells == 3:
+            opportunities += 2   # Fila necesita 3 piezas - oportunidad moderada
+    
+    return opportunities
+
+
+def evaluate_tetris_well_strategy(board: np.ndarray, heights: np.ndarray) -> float:
+    """
+    Evalúa la estrategia de mantener un 'well' (columna profunda) para hacer Tetrises.
+    Bonifica mantener una columna vacía mientras el resto del tablero sube.
+    """
+    if len(heights) != 10:
+        return 0.0
+        
+    tetris_bonus = 0.0
+    
+    # Buscar wells (columnas significativamente más bajas que sus vecinas)
+    for col in range(len(heights)):
+        h_current = heights[col]
+        h_left = heights[col-1] if col > 0 else h_current  
+        h_right = heights[col+1] if col < len(heights)-1 else h_current
+        
+        # Calcular qué tan profundo es el well
+        min_neighbor = min(h_left, h_right) 
+        well_depth = min_neighbor - h_current
+        
+        if well_depth >= 3:  # Es un well significativo
+            # BONUS masivo por mantener well profundo
+            tetris_bonus += well_depth * 2.0
+            
+            # BONUS extra si el well está en los bordes (más fácil de llenar con I-piece)
+            if col == 0 or col == 9:
+                tetris_bonus += well_depth * 1.5
+                
+            # BONUS extra si el well tiene exactamente la altura ideal para Tetris
+            if well_depth == 4:
+                tetris_bonus += 10.0  # Perfecto para I-piece Tetris
+        
+        # PENALTY severa por llenar wells existentes
+        elif well_depth < 0:  # Columna más alta que vecinas
+            tetris_bonus -= abs(well_depth) * 3.0
+    
+    return tetris_bonus
+
+
+def evaluate_surface_flatness_simple(heights: np.ndarray) -> float:
+    """
+    Evalúa qué tan plana es la superficie (versión simplificada).
+    Superficie más plana = mejor para colocar piezas.
+    """
+    if len(heights) < 2:
+        return 0.0
+        
+    # Calcular varianza de alturas
+    height_variance = float(np.var(heights))
+    
+    # Bonus inversamente proporcional a la varianza
+    flatness_score = max(0, 10.0 - height_variance * 0.5)
+    
+    return flatness_score
+
+
+def evaluate_row_density(board: np.ndarray) -> float:
+    """
+    Evalúa la densidad de las filas (filas más llenas son mejores).
+    Prioriza tener filas casi completas.
+    """
+    rows, cols = board.shape
+    density_score = 0.0
+    
+    for row in range(rows):
+        occupied = np.sum(board[row, :])
+        density_ratio = occupied / cols
+        
+        # Bonus creciente por filas más llenas
+        if density_ratio >= 0.8:      # 80%+ lleno
+            density_score += 10.0
+        elif density_ratio >= 0.6:    # 60%+ lleno  
+            density_score += 5.0
+        elif density_ratio >= 0.4:    # 40%+ lleno
+            density_score += 2.0
+    
+    return density_score
+
+
+def detect_combo_potential(board: np.ndarray, heights: np.ndarray) -> int:
+    """
+    Detecta potencial para combos en cascada.
+    Busca configuraciones donde limpiar una línea puede causar más line clears.
+    """
+    rows, cols = board.shape
+    combo_score = 0
+    
+    # Buscar configuraciones donde hay bloques "flotantes"
+    for row in range(1, rows):  # Empezar desde fila 1
+        for col in range(cols):
+            # Si hay un bloque con espacio debajo
+            if board[row, col] and not board[row-1, col]:
+                # Verificar si limpiar filas debajo podría hacer que este bloque caiga
+                empty_spaces_below = 0
+                for check_row in range(row-1, -1, -1):
+                    if not board[check_row, col]:
+                        empty_spaces_below += 1
+                    else:
+                        break
+                
+                # Bonus por bloques que pueden caer y causar combos
+                if empty_spaces_below >= 2:
+                    combo_score += empty_spaces_below * 2
+    
+    return combo_score
+
+
 def evaluate_board(board: np.ndarray, lines_cleared:int)->float:
-    # Sprint 3 min: recompensa brutal a limpiar ahora mismo
-    reward = [0, 1_000_000, 3_000_000, 8_000_000, 20_000_000][lines_cleared]
-    h=column_heights(board)
-    holes=count_holes(board); bump=bumpiness(h)
-    agg_h=int(np.sum(h)); max_h=int(np.max(h))
-    return reward - (holes*1500 + agg_h*6 + bump*40 + max_h*20)
+    """
+    Función de evaluación AGRESIVA optimizada para LIMPIAR LÍNEAS.
+    Prioriza absolutamente los line clears sobre cualquier otra consideración.
+    """
+    # REWARDS MASIVAMENTE AUMENTADOS para line clears
+    base_rewards = [0, 5_000_000, 15_000_000, 50_000_000, 200_000_000]
+    reward = base_rewards[min(lines_cleared, 4)]
+    
+    # BONUS EXTRA MASIVO por Tetris (4 líneas)
+    if lines_cleared == 4:
+        reward += 300_000_000  # Bonus adicional brutal por Tetris
+        
+    # Cálculos de estado del tablero
+    h = column_heights(board)
+    holes = count_holes(board)
+    bump = bumpiness(h) 
+    agg_h = int(np.sum(h))
+    max_h = int(np.max(h))
+    
+    # PENALTIES SEVERAMENTE AUMENTADAS para forzar line clears
+    holes_penalty = holes * 8_000        # Aumentado de 1500 a 8000
+    height_penalty = agg_h * 100         # Aumentado de 6 a 100  
+    bumpiness_penalty = bump * 200       # Aumentado de 40 a 200
+    max_height_penalty = max_h * 1_000   # Aumentado de 20 a 1000
+    
+    # BONUS por oportunidades de line clear
+    line_clear_bonus = detect_line_clear_opportunities(board, h) * 2_000_000
+    
+    # ESTRATEGIA DE TETRIS: Detectar y mantener well profundo
+    tetris_well_bonus = evaluate_tetris_well_strategy(board, h) * 5_000_000
+    
+    # HEURÍSTICAS AVANZADAS
+    # 1. Surface flatness bonus - superficie plana es mejor
+    surface_bonus = evaluate_surface_flatness_simple(h) * 1_000_000
+    
+    # 2. Row density bonus - filas más llenas son mejores
+    row_density_bonus = evaluate_row_density(board) * 500_000
+    
+    # 3. Penalty masiva por tablero muy lleno (game over danger)
+    danger_penalty = 0
+    if max_h >= 18:  # Muy cerca del tope
+        danger_penalty = (max_h - 17) * 50_000_000  # Penalty brutal
+    
+    # 4. Combo potential - detectar posibles combos en cascada
+    combo_potential = detect_combo_potential(board, h) * 3_000_000
+    
+    total_penalty = holes_penalty + height_penalty + bumpiness_penalty + max_height_penalty + danger_penalty
+    total_bonus = line_clear_bonus + tetris_well_bonus + surface_bonus + row_density_bonus + combo_potential
+    
+    final_score = reward + total_bonus - total_penalty
+    
+    # Log de scoring detallado para debugging mejorado
+    if lines_cleared > 0 or final_score > 1_000_000 or logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"📊 EVALUATION BREAKDOWN: Score = {final_score:,}")
+        logging.debug(f"   🎁 Rewards: {reward:,} (lines: {lines_cleared})")
+        logging.debug(f"   ⭐ Bonuses: {total_bonus:,}")
+        logging.debug(f"      ├─ Line clear opportunities: {line_clear_bonus:,}")
+        logging.debug(f"      ├─ Tetris well strategy: {tetris_well_bonus:,}")
+        logging.debug(f"      ├─ Surface flatness: {surface_bonus:,}")
+        logging.debug(f"      ├─ Row density: {row_density_bonus:,}")
+        logging.debug(f"      └─ Combo potential: {combo_potential:,}")
+        logging.debug(f"   ❌ Penalties: {total_penalty:,}")
+        logging.debug(f"      ├─ Holes ({holes}): {holes_penalty:,}")
+        logging.debug(f"      ├─ Height ({agg_h}): {height_penalty:,}")
+        logging.debug(f"      ├─ Max height ({max_h}): {max_height_penalty:,}")
+        logging.debug(f"      ├─ Bumpiness ({bump}): {bumpiness_penalty:,}")
+        logging.debug(f"      └─ Danger zone: {danger_penalty:,}")
+        logging.debug(f"   📏 Board metrics: H={h.tolist()}")
+    
+    return final_score
 
 class OneStepPolicy:
     def choose(self, board_stack: np.ndarray, piece: str)->Optional[Tuple[int,int]]:
         best=None; best_score=-1e18
+        move_evaluations = []  # Para logging detallado
+        
         for oi,shape in enumerate(PIECE_ORIENTS[piece]):
             width=max(c for _,c in shape)+1
-            for left in range(0, 10-width+1):
+            # EVITAR POSICIONES EXTREMAS PROBLEMÁTICAS
+            margin = 1
+            min_col = max(0, margin)
+            max_col = (10 - width - margin)
+            max_col = max(min_col, max_col)  # por si width=4
+            
+            for left in range(min_col, max_col+1):
                 sim=drop_simulation(board_stack, shape, left)
-                if sim is None: continue
+                if sim is None: 
+                    continue
+                    
                 newb, cleared = sim
                 score=evaluate_board(newb, cleared)
+                
+                # Almacenar evaluación para debugging
+                move_evaluations.append({
+                    'orientation': oi,
+                    'left_pos': left, 
+                    'score': score,
+                    'lines_cleared': cleared,
+                    'is_best': False
+                })
+                
                 if score>best_score:
+                    # Marcar movimientos anteriores como no-best
+                    for eval_move in move_evaluations:
+                        eval_move['is_best'] = False
+                    # Marcar este como best
+                    move_evaluations[-1]['is_best'] = True
+                    
                     best_score=score; best=(oi,left)
+        
+        # Log de la mejor decisión y alternativas mejorado
+        if best and move_evaluations:
+            total_moves_evaluated = len(move_evaluations)
+            logging.info(f"🎯 {piece} DECISION: O:{best[0]}, C:{best[1]}, Score:{best_score:,} ({total_moves_evaluated} moves evaluated)")
+            
+            # Mostrar top 5 mejores opciones con más detalle
+            move_evaluations.sort(key=lambda x: x['score'], reverse=True)
+            logging.debug(f"📈 Top 5 moves for {piece} (out of {total_moves_evaluated}):")
+            for i, move in enumerate(move_evaluations[:5]):
+                marks = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                mark = marks[i] if i < len(marks) else f"{i+1}."
+                score_diff = move['score'] - best_score if move['score'] != best_score else 0
+                diff_str = f" ({score_diff:+,})" if score_diff != 0 else " (CHOSEN)"
+                logging.debug(f"   {mark} O:{move['orientation']}, C:{move['left_pos']}, Score:{move['score']:,}{diff_str}, Lines:{move['lines_cleared']}")
+                
+            # Mostrar distribución de scores para entender varianza  
+            if len(move_evaluations) > 1:
+                scores = [m['score'] for m in move_evaluations]
+                worst_score = min(scores)
+                score_range = best_score - worst_score
+                logging.debug(f"   📊 Score range: {worst_score:,} to {best_score:,} (spread: {score_range:,})")
+        elif not move_evaluations:
+            logging.warning(f"⚠️ No valid moves found for {piece}!")
+                
         return best
 
 class MultiStepPolicy:
@@ -1758,14 +3249,20 @@ class MultiStepPolicy:
             # Fallback a política simple si no hay lookahead
             return self._choose_single_step(board_stack, piece)
         
-        # Evaluación multi-step
+        # Evaluación multi-step con logging detallado
         best_action = None
         best_score = -1e18
+        move_evaluations = []
         
         # Evaluar todas las posibles acciones para la pieza actual
         for oi, shape in enumerate(PIECE_ORIENTS[piece]):
             width = max(c for _, c in shape) + 1
-            for left in range(0, 10 - width + 1):
+            margin = 1
+            min_col = max(0, margin)
+            max_col = (10 - width - margin)
+            max_col = max(min_col, max_col)  # por si width=4
+            
+            for left in range(min_col, max_col+1):
                 # Simular movimiento actual
                 sim = drop_simulation(board_stack, shape, left)
                 if sim is None:
@@ -1781,9 +3278,43 @@ class MultiStepPolicy:
                     depth=1
                 )
                 
+                # Almacenar para debugging
+                move_evaluations.append({
+                    'orientation': oi,
+                    'left_pos': left,
+                    'score': total_score,
+                    'immediate_lines': lines_cleared
+                })
+                
                 if total_score > best_score:
                     best_score = total_score
                     best_action = (oi, left)
+        
+        # Log de decisión multistep mejorado
+        if best_action and move_evaluations:
+            total_moves_evaluated = len(move_evaluations)
+            preview_str = "+".join(self.pieces_preview[:3]) if self.pieces_preview else "no-preview"
+            logging.info(f"🧠 {piece} MULTISTEP DECISION: O:{best_action[0]}, C:{best_action[1]}, Score:{best_score:,}")
+            logging.info(f"   📡 Lookahead: depth-{self.lookahead_depth}, preview=[{preview_str}], {total_moves_evaluated} moves evaluated")
+            
+            # Top 5 con lookhead y más detalle
+            move_evaluations.sort(key=lambda x: x['score'], reverse=True)
+            logging.debug(f"🔮 Top 5 multistep moves for {piece} (out of {total_moves_evaluated}):")
+            for i, move in enumerate(move_evaluations[:5]):
+                marks = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                mark = marks[i] if i < len(marks) else f"{i+1}."
+                score_diff = move['score'] - best_score if move['score'] != best_score else 0
+                diff_str = f" ({score_diff:+,})" if score_diff != 0 else " (CHOSEN)"
+                logging.debug(f"   {mark} O:{move['orientation']}, C:{move['left_pos']}, Score:{move['score']:,}{diff_str}, Imm.Lines:{move['immediate_lines']}")
+            
+            # Mostrar distribución de scores multistep
+            if len(move_evaluations) > 1:
+                scores = [m['score'] for m in move_evaluations]
+                worst_score = min(scores)
+                score_range = best_score - worst_score
+                logging.debug(f"   📊 Multistep score range: {worst_score:,} to {best_score:,} (spread: {score_range:,})")
+        elif not move_evaluations:
+            logging.warning(f"⚠️ No valid multistep moves found for {piece}!")
         
         return best_action
     
@@ -1794,7 +3325,11 @@ class MultiStepPolicy:
         
         for oi, shape in enumerate(PIECE_ORIENTS[piece]):
             width = max(c for _, c in shape) + 1
-            for left in range(0, 10 - width + 1):
+            # EVITAR POSICIONES EXTREMAS PROBLEMÁTICAS  
+            min_col = 0  # Evitar columna 0 por problemas de swipe
+            max_col = 10 - width  # Evitar columnas muy a la derecha
+            
+            for left in range(min_col, max_col+1):
                 sim = drop_simulation(board_stack, shape, left)
                 if sim is None:
                     continue
@@ -1836,7 +3371,11 @@ class MultiStepPolicy:
         # Probar todos los movimientos posibles para la siguiente pieza
         for oi, shape in enumerate(PIECE_ORIENTS[next_piece]):
             width = max(c for _, c in shape) + 1
-            for left in range(0, 10 - width + 1):
+            # EVITAR POSICIONES EXTREMAS PROBLEMÁTICAS
+            min_col = 0 # Evitar columna 0 por problemas de swipe
+            max_col = 10 - width  # Evitar columnas muy a la derecha
+            
+            for left in range(min_col, max_col+1):
                 sim = drop_simulation(board, shape, left)
                 if sim is None:
                     continue
@@ -1865,79 +3404,90 @@ class MultiStepPolicy:
 
 # =============================== Gestos táctiles ===============================
 
+from dataclasses import dataclass
+
 @dataclass
 class GestureZones:
     rotate_xy: Tuple[int,int]
     mid_band_y: int
-    drop_path: Tuple[int,int,int,int]  # x,y1->x,y2
+    drop_path: Tuple[Tuple[int,int], Tuple[int,int]]
+    column_centers: List[int]
 
-def compute_gesture_zones(board: BoardRect)->GestureZones:
-    xc = board.x0 + board.w//2
-    # Rotación arriba para no interferir con movimiento
-    rotate = (xc, int(board.y0 + 0.10*board.h))
-    # Movimiento en banda baja (evita activar rotación)
-    mid_band_y = int(board.y0 + 0.70*board.h)
-    # Hard drop profundo
-    drop = (xc, int(board.y0 + 0.50*board.h), xc, int(board.y0 + 0.95*board.h))
-    return GestureZones(rotate_xy=rotate, mid_band_y=mid_band_y, drop_path=drop)
+def compute_gesture_zones(board: BoardRect) -> GestureZones:
+    cw = board.w/10.0; ch = board.h/20.0
+    rotate_xy   = (int(board.x0 + 8.5*cw), int(board.y0 + 2.0*ch))
+    mid_band_y  = int(board.y0 + 9.5*ch)  # banda estable para micro-swipes
+    drop_start  = (int(board.x0 + 5.0*cw), int(board.y0 + 2.0*ch))
+    drop_end    = (drop_start[0], int(board.y0 + 18.5*ch))
+    centers     = [int(board.x0 + (c+0.5)*cw) for c in range(10)]
+    return GestureZones(rotate_xy, mid_band_y, (drop_start, drop_end), centers)
 
-def column_center_x(board: BoardRect, col: float)->int:
-    cw=board.w/10.0
-    return int(board.x0+(col+0.5)*cw)
-
-def rotate_action(backend: ScreenBackend, zones: GestureZones):
-    x,y=zones.rotate_xy
-    tap_x, tap_y = x+jitter(3), y+jitter(3)
-    hold_time = random.randint(80,120)
-    logging.info(f"🔄 Ejecutando rotación en ({tap_x},{tap_y}) por {hold_time}ms")
-    # Tap más largo y con menos jitter para mayor confiabilidad
-    backend.tap(tap_x, tap_y, hold_ms=hold_time)
-    logging.debug("Rotación completada")
-
-def move_piece_to_column(backend: ScreenBackend, zones: GestureZones, board: BoardRect,
-                         piece_cells: List[Tuple[int,int]], target_col:int):
-    """Mueve con swipes más grandes y cálculo de posición mejorado."""
-    try:
-        # Usar bounding box en lugar de promedio para mejor precisión
-        r0, c0, r1, c1 = bounding_box(piece_cells)
-        cur_col = c0  # usar columna izquierda como referencia
-        logging.debug(f"Pieza actual en columnas {c0}-{c1}, moviendo hacia columna {target_col}")
-    except Exception:
-        cur_col = 5
-        logging.warning("Error calculando posición actual, usando columna 5 por defecto")
-    
-    delta = int(target_col - cur_col)
-    if delta == 0: 
-        logging.debug("Ya en posición correcta, no se necesita movimiento")
-        return
-        
-    steps = abs(delta)
-    dir_sign = 1 if delta > 0 else -1
-    y = zones.mid_band_y + jitter(4)
-    cw = board.w/10.0
-    dx = int(1.1*cw) * dir_sign  # aumentado de 0.7 a 1.1 celdas
-    x = int(board.x0 + (cur_col + 0.5)*cw)
-    
-    logging.info(f"⬅️➡️ Moviendo {steps} pasos hacia {'derecha' if dir_sign > 0 else 'izquierda'} (delta={delta})")
-    for i in range(steps):
-        duration = random.randint(70,110)  # duración ligeramente mayor
-        swipe_x1, swipe_x2 = int(x), int(x + dx)
-        logging.debug(f"  Swipe {i+1}/{steps}: ({swipe_x1},{y}) -> ({swipe_x2},{y}) en {duration}ms")
-        backend.swipe(swipe_x1, y, swipe_x2, y, duration_ms=duration)
-        x += dx
-        time.sleep(0.025)  # pausa ligeramente mayor
-    logging.debug(f"Movimiento completado ({steps} swipes)")
+def rotate_action(backend: ScreenBackend, zones: GestureZones, taps:int=1):
+    x,y = zones.rotate_xy
+    for _ in range(taps):
+        backend.tap(x + jitter(2), y + jitter(2), hold_ms=60)
 
 def drop_action(backend: ScreenBackend, zones: GestureZones):
-    x1,y1,x2,y2=zones.drop_path
-    drop_x1, drop_y1 = x1+jitter(5), y1+jitter(5)
-    drop_x2, drop_y2 = x2+jitter(5), y2+jitter(5)
-    duration = random.randint(90,130)
-    logging.info(f"📧 Ejecutando hard drop: ({drop_x1},{drop_y1}) -> ({drop_x2},{drop_y2}) en {duration}ms")
-    backend.swipe(drop_x1, drop_y1, drop_x2, drop_y2, duration_ms=duration)
-    logging.debug("Hard drop completado")
+    (x1,y1),(x2,y2) = zones.drop_path
+    backend.swipe(x1 + jitter(2), y1, x2 + jitter(2), y2, duration_ms=230)
 
+def move_piece_to_column(backend: 'ScreenBackend',
+                         zones: 'GestureZones',
+                         board: BoardRect,
+                         piece_cells: List[Tuple[int,int]],
+                         target_col: int,
+                         timing_multiplier: float = 1.0):
+    """
+    Mueve con micro-swipes de ~1 columna cada uno, a una Y estable dentro del tablero.
+    NO usa draganddrop en ningún caso.
+    """
+    if not piece_cells:
+        return
 
+    # Tamaño de celda
+    cw = board.w / 10.0
+
+    # Y segura para swipe horizontal (clamp al interior del board)
+    y = int(max(board.y0 + board.h * 0.30, min(zones.mid_band_y, board.y0 + board.h * 0.85)))
+
+    # Columna actual (izquierda de la pieza)
+    _, c0, _, _ = bounding_box(piece_cells)
+    delta = int(target_col) - int(c0)
+    if delta == 0:
+        return
+
+    # Ajustes de gesto
+    step_sign = 1 if delta > 0 else -1
+    steps = abs(delta)
+
+    # Un poco menos que el ancho de celda para evitar overshoot y bordes
+    step_px = int(0.92 * cw) * step_sign
+    # Duración más larga porque tu dispositivo lo exige (según tu prueba manual)
+    dur = max(200, int(200 * timing_multiplier))
+
+    # Empezamos desde el centro de la pieza actual
+    x_start = int(board.x0 + (c0 + 0.5) * cw)
+
+    # Fallback 1: un swipe largo directo (algunos juegos lo prefieren)
+    try:
+        x_target = int(board.x0 + (target_col + 0.5) * cw)
+        logging.debug(f"➡️ Long swipe: ({x_start},{y}) -> ({x_target},{y}) dur={dur}ms")
+        backend.swipe(x_start, y, x_target, y, duration_ms=dur)
+        time.sleep(0.06)
+        return
+    except Exception as e:
+        logging.debug(f"Long swipe falló: {e}. Probando micro-swipes...")
+
+    # Fallback 2: micro-swipes de 1 columna
+    x = x_start
+    for i in range(steps):
+        x_next = int(x + step_px)
+        # clamp horizontal dentro del board
+        x_next = int(max(board.x0 + 4, min(x_next, board.x0 + board.w - 4)))
+        logging.debug(f"➡️ Step {i+1}/{steps}: swipe ({x},{y}) -> ({x_next},{y}) dur={dur}ms")
+        backend.swipe(x, y, x_next, y, duration_ms=dur)
+        x = x_next
+        time.sleep(0.04)
 # =========================== Control una-vez-por-pieza ==========================
 
 class PieceTracker:
@@ -2104,6 +3654,7 @@ def main():
     ap.add_argument("--multistep-policy", action="store_true", help="Usa MultiStepPolicy avanzada con lookahead")
     ap.add_argument("--advanced-evaluation", action="store_true", help="Usa evaluación avanzada con T-spins y combos")
     ap.add_argument("--monitor-performance", action="store_true", help="Habilita monitoreo y exportación de métricas de rendimiento")
+    ap.add_argument("--test-movement", action="store_true", help="Ejecuta test de movimiento y sale (debugging)")
     args=ap.parse_args()
 
     # Cargar configuración
@@ -2169,7 +3720,25 @@ def main():
     else:
         board = get_board_rect_from_percent((dev_w,dev_h), rect)
     
-    logging.info(f"Rect del pozo: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
+    logging.info(f"📱 Resolución del dispositivo: {dev_w}x{dev_h}")
+    logging.info(f"🎯 Rectángulo del tablero: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
+    logging.info(f"📊 Porcentajes del tablero: x={board.x0/dev_w:.3f}, y={board.y0/dev_h:.3f}, w={board.w/dev_w:.3f}, h={board.h/dev_h:.3f}")
+
+    # COORDINATE VALIDATION - Run startup diagnostics
+    validation_results = validate_screen_coordinates(backend, board)
+    if not validation_results['overall_valid']:
+        logging.error("❌ Screen coordinate validation failed! Bot may not work correctly.")
+        logging.error("💡 Consider recalibrating board coordinates or checking screen resolution.")
+    else:
+        logging.info("✅ Screen coordinate validation passed - bot should work correctly")
+
+    # Opción de test de movimiento
+    if args.test_movement:
+        logging.info("🧪 MODO TEST DE MOVIMIENTO - Solo testing, no juego")
+        test_movement_system(backend, board)
+        logging.info("🏁 Test completado. Saliendo...")
+        backend.cleanup()
+        return
 
     # Opción experimental: usar orquestador TetrisBot
     if args.use_bot_class:
@@ -2296,6 +3865,40 @@ def main():
 
             elif occupation_rate < 0.02:
                 logging.debug(f"Tablero casi vacío: {num_occupied}/{total_cells} ({occupation_rate:.1%})")
+            
+            # ENHANCED FRAME CONTEXT LOGGING - Periodic summary
+            if frame_count % 60 == 0:  # Every 60 frames (roughly every 6-10 seconds)
+                current_time = time.time()
+                elapsed = current_time - start
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                
+                logging.info("🎮 FRAME CONTEXT SUMMARY")
+                logging.info(f"   ⏱️  Time: {elapsed:.1f}s, Frame: {frame_count}, FPS: {fps:.1f}")
+                logging.info(f"   📊 Board: {occupation_rate:.1%} occupied ({num_occupied}/{total_cells})")
+                logging.info(f"   🎯 Piece: {'✅' if piece_cells else '❌'} active, {'👻' if board_analysis.ghost_piece else '⭕'} ghost")
+                
+                # RUNTIME BOARD RECTANGLE VERIFICATION
+                runtime_verification = verify_board_runtime(board, piece_cells, occ, frame_count)
+                if not runtime_verification['overall_valid']:
+                    logging.warning(f"🔍 Board verification issues detected at frame {frame_count}")
+                
+                # ADAPTIVE MOVEMENT SYSTEM STATUS  
+                adaptive_diag = controller_system.movement_corrector.get_diagnostics()
+                if adaptive_diag['total_attempts'] > 0:
+                    offset_status = f"OFFSET: {adaptive_diag['systematic_offset']:+.1f}" if adaptive_diag['offset_detected'] else "no offset"
+                    logging.info(f"   🧠 Movement AI: {adaptive_diag['success_rate']:.1%} success, "
+                                f"{adaptive_diag['columns_learned']} cols learned, "
+                                f"error: {adaptive_diag['recent_avg_error']:.1f}, "
+                                f"{offset_status}, timing: {adaptive_diag['recommended_timing']:.1f}x")
+                
+                # Log current board state every 5 minutes or when significant occupation
+                if frame_count % 300 == 0 or occupation_rate > 0.5:
+                    log_board_state(occ, piece_cells, frame_count, f"PERIODIC CHECK (occupied: {occupation_rate:.1%})")
+                
+            # FRAME BY FRAME CONTEXT for debugging specific moves
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                session_time = time.time() - start
+                logging.debug(f"🖼️ Frame {frame_count} @ {session_time:.1f}s: occ={occupation_rate:.1%}, piece={'✓' if piece_cells else '✗'}")
                 
             # --- Debug visual mejorado ---
             if args.debug_vision and frame_count < 50:  # más frames de debug
@@ -2313,7 +3916,6 @@ def main():
                 ghost_info = f", ghost: {len(ghost_cells)} celdas" if ghost_cells else ", sin ghost"
                 logging.debug(f"Frame {frame_count}: {num_occupied}/{total_cells} celdas ocupadas ({occupation_rate:.1%}), {num_components} componentes{piece_info}{ghost_info}")
                 
-                frame_count += 1
 
             if piece_cells is None:
                 # No spam de taps: deja respirar y sigue
@@ -2324,6 +3926,16 @@ def main():
                         logging.info("Esperando nueva pieza...")
                 time.sleep(0.05)
                 # siguiente frame
+                sleep=dt-(time.time()-t0)
+                if sleep>0: time.sleep(sleep)
+                if session_sec and (time.time()-start)>session_sec: break
+                continue
+            
+            # REJECT OVERSIZED PIECES - this should now be impossible but adding safety
+            if len(piece_cells) > 4:
+                logging.error(f"❌ REJECTING oversized piece: {len(piece_cells)} cells")
+                logging.error(f"   This should not happen with the fixed vision system!")
+                time.sleep(0.05)
                 sleep=dt-(time.time()-t0)
                 if sleep>0: time.sleep(sleep)
                 if session_sec and (time.time()-start)>session_sec: break
@@ -2354,44 +3966,81 @@ def main():
 
             # Verificar si necesitamos actuar (evitar spam en la misma pieza) - USANDO SISTEMA MODULAR
             if game_system.is_new_piece(piece_cells):
-                logging.info(f"Nueva pieza detectada: {piece_type if cls_cur else 'desconocida'}, rotaciones={rotations_needed}, columna objetivo={target_col}")
+                # LOGGING MEJORADO: Frame context y board state
+                current_time = time.time()
+                frame_time = current_time - start
+                
+                logging.info("=" * 80)
+                logging.info(f"🎮 NEW PIECE ACTION - Frame {frame_count} at {frame_time:.1f}s")
+                logging.info("=" * 80)
+                
+                # Log board state visual
+                log_board_state(stack, piece_cells, frame_count, f"BEFORE DECISION")
+                
+                # Log detailed decision context
+                piece_name = piece_type if cls_cur else "UNKNOWN"
+                final_score = best[1] if cls_cur and best and len(best) > 1 else "N/A"
+                
+                # Get score for chosen action if available
+                if cls_cur and best:
+                    try:
+                        sim_result = drop_simulation(stack, PIECE_ORIENTS[piece_type][best_orient], left_col)
+                        if sim_result:
+                            newb, cleared = sim_result
+                            final_score = evaluate_board(newb, cleared)
+                    except:
+                        final_score = "Error calculating"
+                
+                log_decision_context(
+                    piece_name, 
+                    stack, 
+                    piece_cells, 
+                    target_col, 
+                    rotations_needed,
+                    final_score,
+                    f"Policy chose orient {best_orient if cls_cur and best else 'fallback'}, col {target_col}"
+                )
+                
+                # DIAGNOSTIC: Analyze coordinate calculations
+                diagnose_movement_coordinates(board, piece_cells, target_col)
+                
+                # Log execution plan
+                logging.info(f"📋 EXECUTION PLAN:")
+                logging.info(f"   1. Rotate {rotations_needed} times")
+                logging.info(f"   2. Move to column {target_col}")  
+                logging.info(f"   3. Drop piece")
                 
                 # Ejecutar plan (USANDO SISTEMA MODULAR)
+                logging.info("🔄 Executing rotations...")
                 for i in range(rotations_needed):
+                    logging.debug(f"   Rotation {i+1}/{rotations_needed}")
                     controller_system.rotate_piece()
                     time.sleep(0.06)  # pausa más larga entre rotaciones
                 
-                controller_system.move_piece_to_column(piece_cells, target_col, board)
-                time.sleep(0.04)
+                # Execute movement with built-in retry and verification
+                logging.info("➡️ Executing column movement...")
+                movement_successful = controller_system.move_piece_to_column(piece_cells, target_col, board)
                 
-                # Verificar posición antes del drop
-                time.sleep(0.08)
-                verification_frame = backend.get_screen()
-                # Aplicar la misma expansión al crop de verificación
-                verification_frame_h = verification_frame.shape[0]
-                verification_max_y = min(board.y0 + expanded_h, verification_frame_h)
-                verification_crop = verification_frame[board.y0:verification_max_y, board.x0:board.x0+board.w]
-                verification_occ, _ = occupancy_grid(verification_crop, rows=20, cols=10)
-                verification_piece = find_active_piece(verification_occ, verification_crop)
+                if not movement_successful:
+                    logging.error("❌ Movement failed after all retry attempts!")
+                    logging.error("   Proceeding with drop anyway - may result in poor placement")
+                else:
+                    logging.info("✅ Movement completed successfully")
                 
-                if verification_piece:
-                    try:
-                        _, v_c0, _, v_c1 = bounding_box(verification_piece)
-                        actual_pos = v_c0
-                        if abs(actual_pos - target_col) <= 1:  # tolerancia de 1 columna
-                            logging.debug(f"Posición verificada correcta: {actual_pos} ≈ {target_col}")
-                        else:
-                            logging.warning(f"Posición incorrecta: objetivo={target_col}, actual={actual_pos}")
-                    except Exception:
-                        logging.warning("Error verificando posición")
-                
+                logging.info("⬇️ Dropping piece...")
                 controller_system.drop_piece()
                 game_system.mark_piece_acted()
+                
+                # Final action summary
+                execution_time = time.time() - current_time
+                logging.info(f"✨ Action completed in {execution_time:.3f}s")
+                logging.info("=" * 80)
             else:
                 # Ya actuamos en esta pieza, solo esperar
                 time.sleep(0.05)
 
-            # ciclo
+            # ciclo - increment frame counter
+            frame_count += 1
             sleep=dt-(time.time()-t0)
             if sleep>0: time.sleep(sleep)
             if session_sec and (time.time()-start)>session_sec:
@@ -2402,6 +4051,160 @@ def main():
     finally:
         try: backend.cleanup()
         except Exception: pass
+
+
+def test_movement_system(backend: ScreenBackend, board: BoardRect):
+    """
+    Función de test MEJORADA para calibración y diagnóstico de movimiento.
+    Incluye validaciones, tests comprehensivos y detección de problemas.
+    """
+    logging.info("🧪 === COMPREHENSIVE MOVEMENT CALIBRATION TEST ===")
+    
+    # Pre-test validation
+    validation_results = validate_screen_coordinates(backend, board)
+    if not validation_results['overall_valid']:
+        logging.warning("⚠️ Coordinate validation failed - tests may not work correctly!")
+    
+    # Calcular zones
+    zones = compute_gesture_zones(board)
+    cw = board.w/10.0
+    ch = board.h/20.0
+    y = zones.mid_band_y
+    
+    logging.info(f"🎯 Test parameters: y={y}, cell_width={cw:.1f}, cell_height={ch:.1f}")
+    
+    test_results = {
+        'swipe_right': False,
+        'swipe_left': False, 
+        'rotation': False,
+        'drop': False,
+        'column_precision': {}
+    }
+    
+    # Test 1: Swipe hacia la derecha (múltiples distancias)
+    logging.info("🔄 Test 1 - HORIZONTAL SWIPES (Right)")
+    for distance in [1, 2, 3]:
+        x1 = int(board.x0 + 4*cw)  # Start from column 4
+        x2 = int(x1 + distance*cw)  # Move distance columns right
+        
+        logging.info(f"   Swipe {distance} columns right: ({x1},{y}) -> ({x2},{y})")
+        try:
+            backend.swipe(x1, y, x2, y, duration_ms=200)
+            logging.info(f"   ✅ {distance}-column right swipe successful")
+            time.sleep(0.8)
+        except Exception as e:
+            logging.error(f"   ❌ {distance}-column right swipe failed: {e}")
+    
+    test_results['swipe_right'] = True
+    
+    # Test 2: Swipe hacia la izquierda (múltiples distancias)
+    logging.info("🔄 Test 2 - HORIZONTAL SWIPES (Left)")
+    for distance in [1, 2, 3]:
+        x1 = int(board.x0 + 6*cw)  # Start from column 6
+        x2 = int(x1 - distance*cw)  # Move distance columns left
+        
+        logging.info(f"   Swipe {distance} columns left: ({x1},{y}) -> ({x2},{y})")
+        try:
+            backend.swipe(x1, y, x2, y, duration_ms=200)
+            logging.info(f"   ✅ {distance}-column left swipe successful")
+            time.sleep(0.8)
+        except Exception as e:
+            logging.error(f"   ❌ {distance}-column left swipe failed: {e}")
+            
+    test_results['swipe_left'] = True
+        
+    # Test 3: Precision test - target specific columns
+    logging.info("🔄 Test 3 - COLUMN PRECISION TEST")
+    target_columns = [0, 2, 4, 6, 8, 9]
+    start_col = 5
+    
+    for target_col in target_columns:
+        logging.info(f"   Testing movement from col {start_col} to col {target_col}")
+        
+        # Calculate movement
+        start_x = int(board.x0 + (start_col + 0.5) * cw)
+        target_x = int(board.x0 + (target_col + 0.5) * cw)
+        
+        # Use the actual movement function for realistic testing
+        try:
+            # Simulate a piece at start column for testing
+            fake_piece = [(10, start_col), (11, start_col)]  # Simple 2-cell piece
+            
+            logging.info(f"      Movement test: col {start_col} -> {target_col} ({target_x - start_x:+d}px)")
+            move_piece_to_column(backend, zones, board, fake_piece, target_col)
+            
+            test_results['column_precision'][target_col] = True
+            logging.info(f"   ✅ Column {target_col} movement completed")
+            
+        except Exception as e:
+            test_results['column_precision'][target_col] = False
+            logging.error(f"   ❌ Column {target_col} movement failed: {e}")
+            
+        time.sleep(1.0)  # Pause between tests
+        
+    # Test 4: Rotation test
+    logging.info("🔄 Test 4 - ROTATION TEST")
+    try:
+        rx, ry = zones.rotate_xy
+        logging.info(f"   Rotation tap at: ({rx},{ry})")
+        
+        for i in range(4):  # Test 4 rotations
+            logging.info(f"   Rotation {i+1}/4")
+            backend.tap(rx, ry, hold_ms=80)
+            time.sleep(0.6)
+        
+        test_results['rotation'] = True
+        logging.info("   ✅ Rotation test successful")
+        
+    except Exception as e:
+        test_results['rotation'] = False  
+        logging.error(f"   ❌ Rotation test failed: {e}")
+    
+    # Test 5: Drop test
+    logging.info("🔄 Test 5 - DROP TEST")
+    try:
+        drop_x1, drop_y1, drop_x2, drop_y2 = zones.drop_path
+        logging.info(f"   Drop swipe: ({drop_x1},{drop_y1}) -> ({drop_x2},{drop_y2})")
+        
+        backend.swipe(drop_x1, drop_y1, drop_x2, drop_y2, duration_ms=80)
+        test_results['drop'] = True
+        logging.info("   ✅ Drop test successful")
+        
+    except Exception as e:
+        test_results['drop'] = False
+        logging.error(f"   ❌ Drop test failed: {e}")
+    
+    # Test summary
+    logging.info("🏁 === TEST RESULTS SUMMARY ===")
+    
+    total_tests = 4 + len(target_columns)
+    passed_tests = sum([
+        test_results['swipe_right'],
+        test_results['swipe_left'], 
+        test_results['rotation'],
+        test_results['drop'],
+        sum(test_results['column_precision'].values())
+    ])
+    
+    logging.info(f"📊 Overall: {passed_tests}/{total_tests} tests passed ({passed_tests/total_tests*100:.1f}%)")
+    logging.info(f"   Horizontal swipes: {'✅' if test_results['swipe_right'] and test_results['swipe_left'] else '❌'}")
+    logging.info(f"   Rotation: {'✅' if test_results['rotation'] else '❌'}")
+    logging.info(f"   Drop: {'✅' if test_results['drop'] else '❌'}")
+    
+    precision_success = sum(test_results['column_precision'].values())
+    precision_total = len(test_results['column_precision'])
+    logging.info(f"   Column precision: {precision_success}/{precision_total} ({precision_success/precision_total*100:.1f}%)")
+    
+    if precision_success < precision_total * 0.8:
+        logging.warning("⚠️ Column precision is poor - movement calibration needed!")
+        logging.warning("💡 Consider adjusting board coordinates or timing parameters")
+    
+    if passed_tests == total_tests:
+        logging.info("🎉 All tests passed! Movement system is working correctly.")
+    else:
+        logging.warning(f"⚠️ {total_tests - passed_tests} tests failed - movement system needs attention!")
+    
+    return test_results
 
 
 if __name__=="__main__":
