@@ -11,10 +11,7 @@ Cambios clave:
 
 import argparse, logging, platform, random, signal, subprocess, sys, time, os
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import Any
+from typing import Optional, Tuple, List, Dict
 import numpy as np
 import cv2
 
@@ -145,16 +142,12 @@ class TetrisVision:
     
     def analyze_board(self, crop: np.ndarray, rows=20, cols=10, use_temporal_filter=True) -> BoardAnalysis:
         """Análisis completo del tablero en un frame"""
-        # Análisis básico (sin cambios)
+        # Análisis básico
         occ, debug_mask = occupancy_grid(crop, rows, cols)
-        
-        num_occupied = int(occ.sum())
-        total_cells = rows * cols
-        occupation_rate = num_occupied / total_cells
-        
+
         # Detección de pieza activa con filtrado temporal
         raw_piece_cells = find_active_piece(occ, crop)
-        
+
         if use_temporal_filter:
             # Añadir detección al filtro temporal
             self.temporal_filter.add_detection(raw_piece_cells)
@@ -162,13 +155,25 @@ class TetrisVision:
             piece_cells = self.temporal_filter.get_filtered_piece()
         else:
             piece_cells = raw_piece_cells
-        
+
         # Detección de ghost usando la pieza filtrada
         ghost_cells = detect_ghost_component(crop, occ, piece_cells) if piece_cells else []
-        
+
+        if ghost_cells:
+            # Quitar ghost de la grilla de ocupación
+            remove_cells(occ, ghost_cells)
+            # Limpiar también la máscara de depuración para reflejar la corrección
+            for r, c in ghost_cells:
+                y0, y1, x0, x1 = _cell_rect(r, c, (rows, cols), crop.shape)
+                debug_mask[y0:y1, x0:x1] = 0
+
+        num_occupied = int(occ.sum())
+        total_cells = rows * cols
+        occupation_rate = num_occupied / total_cells
+
         components = list_components(occ, max_component_size=8)
         components_found = len(components)
-        
+
         return BoardAnalysis(
             occupancy_grid=occ,
             debug_mask=debug_mask,
@@ -792,9 +797,11 @@ def auto_calibrate_board_rect(backend: 'ScreenBackend', config: TetrisConfig) ->
             return None
 
         actual_ratio = board_height / max(1, board_width)
-        # Rango amplio alrededor de 2:1
-        if not (1.5 <= actual_ratio <= 2.5):
-            logging.warning(f"Ratio detectado {actual_ratio:.2f} fuera del rango esperado (1.5-2.5)")
+        tolerance = 0.5  # permisividad alrededor del ratio esperado
+        if not (expected_ratio - tolerance <= actual_ratio <= expected_ratio + tolerance):
+            logging.warning(
+                f"Ratio detectado {actual_ratio:.2f} fuera del rango esperado ({expected_ratio - tolerance:.1f}-{expected_ratio + tolerance:.1f})"
+            )
             return None
 
         detected_rect = BoardRect(left, top, board_width, board_height)
@@ -864,7 +871,6 @@ def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
     # ---- parámetros por modo ----
     if mode == "tight":
         PAD_C      = 0.22
-        RING_PAD   = 0.06
         BG_FLOOR   = 12.0   # piso de distancia Lab al fondo
         S_MIN      = 70     # filtros suaves (no matar piezas rosadas)
         V_MIN      = 110
@@ -875,7 +881,6 @@ def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
         SHADOW_LAB_MAX = 15   # distancia intermedia al fondo
     else:
         PAD_C      = 0.20
-        RING_PAD   = 0.06
         BG_FLOOR   = 10.0
         S_MIN      = 65
         V_MIN      = 105
@@ -925,9 +930,8 @@ def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
     last_row_y0 = row_boundaries[rows-1]
     last_row_y1 = row_boundaries[rows]
     pixels_per_row = H / float(rows)
-    expected_bottom = H  # With linspace, we always use full height
-    
-    logging.info(f"🔍 Grid boundary analysis (pixel-perfect):")
+
+    logging.info("🔍 Grid boundary analysis (pixel-perfect):")
     logging.info(f"   Crop size: {H}x{W} pixels")
     logging.info(f"   Average pixels per row: {pixels_per_row:.1f}")
     logging.info(f"   Last row boundaries: y={last_row_y0} to y={last_row_y1} (height: {last_row_y1-last_row_y0})")
@@ -1097,6 +1101,18 @@ def bounding_box(cells: [Tuple[int,int]]) -> Tuple[int,int,int,int]:
     rs = [r for r,_ in cells]; cs = [c for _,c in cells]
     return min(rs), min(cs), max(rs), max(cs)
 
+def _cell_rect(r: int, c: int,
+               grid_shape: Tuple[int, int],
+               img_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """Devuelve (y0,y1,x0,x1) para la celda (r,c) usando límites pixel-perfect."""
+    rows, cols = int(grid_shape[0]), int(grid_shape[1])
+    H, W = img_shape[:2]
+    row_boundaries = np.linspace(0, H, rows + 1, dtype=int)
+    col_boundaries = np.linspace(0, W, cols + 1, dtype=int)
+    y0, y1 = row_boundaries[r], row_boundaries[r + 1]
+    x0, x1 = col_boundaries[c], col_boundaries[c + 1]
+    return y0, y1, x0, x1
+
 def _avg_sat_of_component(board_bgr: np.ndarray,
                           
                           comp: List[Tuple[int,int]],
@@ -1160,8 +1176,8 @@ def detect_ghost_component(board_bgr: np.ndarray,
     val_active = _avg_val_of_component(board_bgr, piece_cells, grid_shape)
 
     # umbrales robustos (ajustables)
-    SAT_DELTA_MIN = 12.0   # ghost debe ser bastante menos saturado
-    V_DELTA_MIN   = 8.0    # y un poco más brillante
+    SAT_DELTA_MIN = 8.0    # ghost debe ser menos saturado
+    V_DELTA_MIN   = 5.0    # y un poco más brillante
     MAX_GHOST_SIZE = 6
 
     comps = list_components(occ, max_component_size=12)
@@ -1320,32 +1336,40 @@ def classify_piece(cells: List[Tuple[int,int]])->Optional[Tuple[str,int]]:
     return None
 
 def filter_ghost_pieces(board_bgr: np.ndarray,
+                        occ: np.ndarray,
                         comps: List[List[Tuple[int,int]]],
                         grid_shape: Tuple[int,int]=(20,10)) -> List[List[Tuple[int,int]]]:
     """
     Quita de 'comps' cualquier componente que cumpla las condiciones de ghost
     respecto a la pieza más alta (ancla).
     """
-    if not comps: 
+    if not comps:
         return comps
     # ancla: componente válido más alto (menor r0)
     anchor = min(comps, key=lambda c: bounding_box(c)[0])
     r0a,_,r1a,_ = bounding_box(anchor)
     rows, cols = grid_shape
 
+    # identificar ghost explícitamente usando la ancla
+    ghost_cells = detect_ghost_component(board_bgr, occ, anchor)
+    ghost_set = set(ghost_cells)
+
     # métricas del ancla
     sat_anchor = _avg_sat_of_component(board_bgr, anchor, grid_shape)
     val_anchor = _avg_val_of_component(board_bgr, anchor, grid_shape)
     cols_anchor = set(c for _,c in anchor)
 
-    SAT_DELTA_MIN = 12.0
-    V_DELTA_MIN   = 8.0
+    SAT_DELTA_MIN = 8.0
+    V_DELTA_MIN   = 5.0
 
     out=[]
     removed=0
     for comp in comps:
         if comp is anchor:
             out.append(comp); continue
+        if ghost_set and set(comp).issubset(ghost_set):
+            removed += 1
+            continue
         r0, c0, r1, c1 = bounding_box(comp)
         if r0 <= r1a:
             out.append(comp); continue
@@ -1445,7 +1469,7 @@ def find_active_piece(occ: np.ndarray, board_bgr: np.ndarray=None) -> Optional[L
 
     # 1) eliminar ghost antes de puntuar
     if board_bgr is not None and len(comps) >= 2:
-        comps = filter_ghost_pieces(board_bgr, comps, grid_shape)
+        comps = filter_ghost_pieces(board_bgr, occ, comps, grid_shape)
 
     best=None; best_top=1e9; best_score=-1
     for i, comp in enumerate(comps):
@@ -1460,7 +1484,6 @@ def find_active_piece(occ: np.ndarray, board_bgr: np.ndarray=None) -> Optional[L
             continue
 
         in_upper = (r0 <= 10)
-        in_low   = (r0 >= 15)
 
         # aislamiento relativo
         iso = _is_isolated_piece(comp, occ, min_gap=1)
@@ -1845,7 +1868,7 @@ def rotate_action(backend: ScreenBackend, zones: GestureZones):
     logging.info(f"🔄 Ejecutando rotación en ({tap_x},{tap_y}) por {hold_time}ms")
     # Tap más largo y con menos jitter para mayor confiabilidad
     backend.tap(tap_x, tap_y, hold_ms=hold_time)
-    logging.debug(f"Rotación completada")
+    logging.debug("Rotación completada")
 
 def move_piece_to_column(backend: ScreenBackend, zones: GestureZones, board: BoardRect,
                          piece_cells: List[Tuple[int,int]], target_col:int):
@@ -2128,7 +2151,7 @@ def main():
     if args.use_bot_class:
         logging.info("🤖 Modo experimental: Usando orquestador TetrisBot")
         try:
-            bot = TetrisBot(config, backend, board)
+            _ = TetrisBot(config, backend, board)
             # Por ahora, el orquestador solo se inicializa pero no ejecuta
             logging.info("✅ TetrisBot inicializado correctamente")
             logging.info("⚠️  El orquestador completo estará disponible en una versión futura")
@@ -2205,23 +2228,23 @@ def main():
                 bottom_3_rows = occ[-3:, :]  # Últimas 3 filas
                 row_occupancy = [np.sum(bottom_3_rows[i, :]) for i in range(3)]
                 total_bottom_occupied = np.sum(bottom_3_rows)
-                
+
                 if frame_count % 30 == 0 or total_bottom_occupied > 0:  # Log más frecuente si hay ocupación
-                    logging.info(f"🎯 Bottom rows analysis:")
-                    logging.info(f"   Row {rows-3}: {row_occupancy[0]}/{cols} occupied")  
+                    logging.info("🎯 Bottom rows analysis:")
+                    logging.info(f"   Row {rows-3}: {row_occupancy[0]}/{cols} occupied")
                     logging.info(f"   Row {rows-2}: {row_occupancy[1]}/{cols} occupied")
                     logging.info(f"   Row {rows-1} (bottom): {row_occupancy[2]}/{cols} occupied")
                     logging.info(f"   Total bottom 3 rows: {total_bottom_occupied}/{cols*3} occupied")
-                    
-                    # Advertir si hay patrones sospechosos
-                    if row_occupancy[2] == 0 and (row_occupancy[0] > 0 or row_occupancy[1] > 0):
-                        logging.warning(f"⚠️ SUSPICIOUS: Upper rows have pieces but bottom row is empty!")
-                        logging.warning(f"💡 This may indicate the board crop is missing the bottom row!")
-                        logging.warning(f"🔧 Current expansion: {expansion_factor:.2f}x (add +{(expansion_factor-1)*100:.0f}%)")
-                        
-                        # Sugerir mayor expansión si el patrón persiste
-                        if frame_count > 300:  # Después de 5 segundos
-                            logging.error(f"🚨 PERSISTENT BOTTOM ROW ISSUE - Consider increasing expansion_factor to 1.10 or higher!")
+
+                # Advertir si hay patrones sospechosos
+                if row_occupancy[2] == 0 and (row_occupancy[0] > 0 or row_occupancy[1] > 0):
+                    logging.warning("⚠️ SUSPICIOUS: Upper rows have pieces but bottom row is empty!")
+                    logging.warning("💡 This may indicate the board crop is missing the bottom row!")
+                    logging.warning(f"🔧 Current expansion: {expansion_factor:.2f}x (add +{(expansion_factor-1)*100:.0f}%)")
+
+                    # Sugerir mayor expansión si el patrón persiste
+                    if frame_count > 300:  # Después de 5 segundos
+                        logging.error("🚨 PERSISTENT BOTTOM ROW ISSUE - Consider increasing expansion_factor to 1.10 or higher!")
             else:
                 bottom_row_occupied = np.sum(occ[-1, :]) if rows > 0 else 0
                 logging.debug(f"Bottom row: {bottom_row_occupied}/{cols} occupied")
