@@ -142,16 +142,12 @@ class TetrisVision:
     
     def analyze_board(self, crop: np.ndarray, rows=20, cols=10, use_temporal_filter=True) -> BoardAnalysis:
         """Análisis completo del tablero en un frame"""
-        # Análisis básico (sin cambios)
+        # Análisis básico
         occ, debug_mask = occupancy_grid(crop, rows, cols)
-        
-        num_occupied = int(occ.sum())
-        total_cells = rows * cols
-        occupation_rate = num_occupied / total_cells
-        
+
         # Detección de pieza activa con filtrado temporal
         raw_piece_cells = find_active_piece(occ, crop)
-        
+
         if use_temporal_filter:
             # Añadir detección al filtro temporal
             self.temporal_filter.add_detection(raw_piece_cells)
@@ -159,13 +155,25 @@ class TetrisVision:
             piece_cells = self.temporal_filter.get_filtered_piece()
         else:
             piece_cells = raw_piece_cells
-        
+
         # Detección de ghost usando la pieza filtrada
         ghost_cells = detect_ghost_component(crop, occ, piece_cells) if piece_cells else []
-        
+
+        if ghost_cells:
+            # Quitar ghost de la grilla de ocupación
+            remove_cells(occ, ghost_cells)
+            # Limpiar también la máscara de depuración para reflejar la corrección
+            for r, c in ghost_cells:
+                y0, y1, x0, x1 = _cell_rect(r, c, (rows, cols), crop.shape)
+                debug_mask[y0:y1, x0:x1] = 0
+
+        num_occupied = int(occ.sum())
+        total_cells = rows * cols
+        occupation_rate = num_occupied / total_cells
+
         components = list_components(occ, max_component_size=8)
         components_found = len(components)
-        
+
         return BoardAnalysis(
             occupancy_grid=occ,
             debug_mask=debug_mask,
