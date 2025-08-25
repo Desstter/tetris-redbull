@@ -22,8 +22,12 @@ try:
     import pygetwindow as gw
     import mss
     SCRCPY_DEPS_OK = True
-except Exception:
+except (ImportError, OSError) as e:
+    logging.warning(f"Dependencias opcionales no disponibles: {e}")
     SCRCPY_DEPS_OK = False
+
+BOARD_COLS = 10
+BOARD_ROWS = 20
 
 
 # ============================ Utilidades generales ============================
@@ -36,11 +40,13 @@ def setup_logging(verbose: bool):
 
 def parse_rect(rect_str: str) -> Tuple[float, float, float, float]:
     try:
-        x,y,w,h = [float(t.strip()) for t in rect_str.split(",")]
-        assert 0<=x<=1 and 0<=y<=1 and 0<w<=1 and 0<h<=1
-        return x,y,w,h
-    except Exception:
+        x, y, w, h = [float(t.strip()) for t in rect_str.split(",")]
+    except ValueError:
         raise argparse.ArgumentTypeError('Rect inválido. Usa "x,y,w,h" en [0..1].')
+
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+        raise argparse.ArgumentTypeError('Rect inválido. Usa "x,y,w,h" en [0..1].')
+    return x, y, w, h
 
 def jitter(px:int)->int:
     return random.randint(-px, px) if px>0 else 0
@@ -67,7 +73,18 @@ class TetrisConfig:
                 "tight_mode": {"pad_c": 0.22, "ring_pad": 0.06, "bg_floor": 12.0, "s_min": 70, "v_min": 110, "k_clusters": 3}
             },
             "devices": {"default": {"rect": [0.185, 0.225, 0.63, 0.57]}},
-            "gameplay": {"fps": 10, "session_sec": 185, "piece_tracker_timeout": 1.5, "max_component_size": 4}
+            "gameplay": {"fps": 10, "session_sec": 185, "piece_tracker_timeout": 1.5, "max_component_size": 4},
+            "delays": {
+                "short": 0.05,
+                "rotate": 0.06,
+                "long": 0.8,
+                "medium": 0.6,
+                "retry_base": 0.12,
+                "retry_step": 0.05,
+                "calibration": 0.25,
+                "swipe_step": 0.04,
+                "test_pause": 1.0
+            }
         }
         
         try:
@@ -109,6 +126,10 @@ class TetrisConfig:
     def get_gameplay_param(self, param, default=None):
         """Obtiene parámetro de gameplay"""
         return self.config.get("gameplay", {}).get(param, default)
+
+    def get_delay(self, name, default=None):
+        """Obtiene intervalos de espera parametrizados"""
+        return self.config.get("delays", {}).get(name, default)
     
     def get_gesture_param(self, category, param, default=None):
         """Obtiene parámetro de gestos"""
@@ -141,7 +162,7 @@ class TetrisVision:
             confidence_threshold=config.config.get("vision", {}).get("temporal_filter_threshold", 0.7)  # Increased from 0.6
         )
     
-    def analyze_board(self, crop: np.ndarray, rows=20, cols=10, use_temporal_filter=True) -> BoardAnalysis:
+    def analyze_board(self, crop: np.ndarray, rows=BOARD_ROWS, cols=BOARD_COLS, use_temporal_filter=True) -> BoardAnalysis:
         """
         Análisis completo del tablero usando el nuevo sistema multilayer.
         Mucho más robusto que el sistema anterior basado en comparaciones HSV relativas.
@@ -255,7 +276,7 @@ class TetrisVision:
             components_found=components_found
         )
     
-    def get_occupancy_grid(self, crop: np.ndarray, rows=20, cols=10, mode="normal"):
+    def get_occupancy_grid(self, crop: np.ndarray, rows=BOARD_ROWS, cols=BOARD_COLS, mode="normal"):
         """Wrapper para occupancy_grid - migración gradual"""
         return occupancy_grid(crop, rows, cols, mode)
     
@@ -362,7 +383,7 @@ class TemporalFilter:
             
         # Verificar que las coordenadas están en rango válido
         for r, c in cells:
-            if r < 0 or r >= 20 or c < 0 or c >= 10:
+            if r < 0 or r >= BOARD_ROWS or c < 0 or c >= BOARD_COLS:
                 return False
                 
         # Verificar conectividad (células adyacentes)
@@ -399,7 +420,8 @@ class TemporalFilter:
                 if left_col not in position_groups:
                     position_groups[left_col] = []
                 position_groups[left_col].append(piece)
-            except:
+            except ValueError as e:
+                logging.debug(f"bounding_box falló para {piece}: {e}")
                 continue
                 
         # Encontrar el grupo más grande (consenso)
@@ -615,10 +637,12 @@ class TetrisController:
             base_timing = adaptive_timing + (retry_count * 0.3)
             logging.info(f"🔄 Movement attempt {retry_count + 1}/{max_retries + 1} (timing: {base_timing:.1f}x)")
             
-            move_piece_to_column(self.backend, self.zones, board, piece_cells, corrected_target, base_timing)
+            move_piece_to_column(self.backend, self.zones, board, piece_cells, corrected_target, base_timing, self.config)
             
             # Espera extra para que el movimiento se complete
-            time.sleep(0.12 + retry_count * 0.05)
+            base_delay = self.config.get_delay("retry_base", 0.12)
+            step_delay = self.config.get_delay("retry_step", 0.05)
+            time.sleep(base_delay + retry_count * step_delay)
             
             # VERIFICACIÓN REAL POST-MOVIMIENTO
             if retry_count < max_retries:
@@ -666,7 +690,7 @@ class TetrisController:
             frame = self.backend.get_screen()
             crop = frame[board.y0:board.y0+board.h, board.x0:board.x0+board.w]
             
-            occ, _ = occupancy_grid(crop, rows=20, cols=10)
+            occ, _ = occupancy_grid(crop, rows=BOARD_ROWS, cols=BOARD_COLS)
             current_piece = find_active_piece(occ, crop)
             
             if current_piece:
@@ -760,7 +784,7 @@ class TetrisBot:
         - Rota, mueve, drop
         - Métricas + debug
         """
-        rows, cols = 20, 10
+        rows, cols = BOARD_ROWS, BOARD_COLS
         t0 = time.time()
         frame_idx = 0
         saved_dbg = 0
@@ -830,7 +854,7 @@ class TetrisBot:
                 spins = (target_orient - cur_orient) % total_orients
                 for _ in range(spins):
                     self.controller.rotate_piece()
-                    time.sleep(0.05)
+                    time.sleep(self.config.get_delay("short", 0.05))
 
                 # Mover a columna
                 self.controller.move_piece_to_column(piece_cells, target_left, self.board)
@@ -1103,11 +1127,17 @@ class ADBBackend(ScreenBackend):
         raise RuntimeError("adb swipe falló en todas las variantes.")
 
 class ScrcpyBackend(ScreenBackend):
-    def __init__(self, serial: Optional[str]=None, title="TetrisBot"):
+    def __init__(self, serial: Optional[str]=None, title="TetrisBot", config: TetrisConfig = None):
         if not SCRCPY_DEPS_OK:
             raise RuntimeError("scrcpy backend requiere pyautogui, pygetwindow, mss")
-        self.serial=serial; self.title=title; self.proc=None; self.win=None; self.res=None
-        pyautogui.FAILSAFE=False; pyautogui.PAUSE=0.02
+        self.serial = serial
+        self.title = title
+        self.proc = None
+        self.win = None
+        self.res = None
+        self.config = config or TetrisConfig()
+        pyautogui.FAILSAFE = False
+        pyautogui.PAUSE = 0.02
     def _all_titles(self):
         try: return gw.getAllTitles()
         except Exception: return []
@@ -1126,7 +1156,7 @@ class ScrcpyBackend(ScreenBackend):
                 except Exception: pass
                 logging.debug(f"Ventana scrcpy: {w.title} ({w.left},{w.top}) {w.width}x{w.height}")
                 return
-            time.sleep(0.25)
+            time.sleep(self.config.get_delay("calibration", 0.25))
         raise RuntimeError("No se encontró la ventana de scrcpy.")
     def _spawn_scrcpy(self):
         base=["scrcpy"]; 
@@ -1142,7 +1172,7 @@ class ScrcpyBackend(ScreenBackend):
                 self.proc=subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags)
             except FileNotFoundError:
                 raise RuntimeError("scrcpy no está en PATH.")
-            time.sleep(0.8)
+            time.sleep(self.config.get_delay("long", 0.8))
             rc=self.proc.poll()
             if rc is None: return
             try: _,err=self.proc.communicate(timeout=0.2); last_err=(err or b"").decode(errors="ignore")
@@ -1178,11 +1208,13 @@ class ScrcpyBackend(ScreenBackend):
 
 
 class HybridBackend(ScreenBackend):
-    def __init__(self, serial: Optional[str]=None):
-        self.adb=ADBBackend(serial)
-        self.scr=None
-        if SCRCPY_DEPS_OK: self.scr=ScrcpyBackend(serial)
-        self._scr_ok=False; self._res=None
+    def __init__(self, serial: Optional[str]=None, config: TetrisConfig = None):
+        self.adb = ADBBackend(serial)
+        self.scr = None
+        if SCRCPY_DEPS_OK:
+            self.scr = ScrcpyBackend(serial, config=config)
+        self._scr_ok = False
+        self._res = None
     def connect(self):
         self.adb.connect(); self._res=self.adb.get_resolution()
         if self.scr:
@@ -1209,7 +1241,7 @@ class HybridBackend(ScreenBackend):
 @dataclass
 class BoardRect:
     x0:int; y0:int; w:int; h:int
-    def cell_rect(self,r:int,c:int,rows=20,cols=10)->Tuple[int,int,int,int]:
+    def cell_rect(self,r:int,c:int,rows=BOARD_ROWS,cols=BOARD_COLS)->Tuple[int,int,int,int]:
         cw=self.w/cols; ch=self.h/rows
         return int(self.x0+c*cw), int(self.y0+r*ch), int(cw), int(ch)
 
@@ -1395,7 +1427,7 @@ def classify_cell_type(hsv_cell: np.ndarray) -> str:
     return 'background'
 
 
-def occupancy_grid_multilayer(board_bgr, rows=20, cols=10, mode="normal"):
+def occupancy_grid_multilayer(board_bgr, rows=BOARD_ROWS, cols=BOARD_COLS, mode="normal"):
     """
     Nueva versión de occupancy_grid que clasifica cada celda en 3 tipos:
     - background_grid: Celdas de fondo
@@ -1533,7 +1565,7 @@ def extract_components_by_type(active_grid: np.ndarray, ghost_grid: np.ndarray,
     return active_components, ghost_components
 
 
-def detect_pieces_multilayer(board_bgr: np.ndarray, rows=20, cols=10, mode="normal") -> tuple:
+def detect_pieces_multilayer(board_bgr: np.ndarray, rows=BOARD_ROWS, cols=BOARD_COLS, mode="normal") -> tuple:
     """
     Nueva función de detección de piezas usando el sistema multilayer.
     Reemplaza la lógica compleja anterior con un enfoque directo basado en colores absolutos.
@@ -1594,7 +1626,7 @@ def detect_pieces_multilayer(board_bgr: np.ndarray, rows=20, cols=10, mode="norm
     return active_piece, ghost_piece, debug_info
 
 
-def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
+def occupancy_grid(board_bgr, rows=BOARD_ROWS, cols=BOARD_COLS, mode="normal"):
     """
     Segmentación por celda basada en MODELO DE FONDO con EXCLUSIÓN DE SOMBRAS:
     - Aprende 2–3 clusters de fondo en CIE-Lab (kmeans).
@@ -1779,7 +1811,7 @@ def occupancy_grid(board_bgr, rows=20, cols=10, mode="normal"):
     return occ, mask
 
 
-def occupancy_grid_tight(board_bgr, rows=20, cols=10):
+def occupancy_grid_tight(board_bgr, rows=BOARD_ROWS, cols=BOARD_COLS):
     """
     Versión más estricta de occupancy_grid para tableros muy llenos.
     Usa parámetros 'tight' para detectar mejor las piezas en condiciones difíciles.
@@ -2100,7 +2132,7 @@ def classify_piece(cells: List[Tuple[int,int]])->Optional[Tuple[str,int]]:
 def filter_ghost_pieces(board_bgr: np.ndarray,
                         occ: np.ndarray,
                         comps: List[List[Tuple[int,int]]],
-                        grid_shape: Tuple[int,int]=(20,10)) -> List[List[Tuple[int,int]]]:
+                        grid_shape: Tuple[int,int]=(BOARD_ROWS,BOARD_COLS)) -> List[List[Tuple[int,int]]]:
     """
     Quita de 'comps' cualquier componente que cumpla las condiciones de ghost
     respecto a la pieza más alta (ancla).
@@ -2398,7 +2430,7 @@ def diagnose_movement_coordinates(board: 'BoardRect', piece_cells: List[Tuple[in
     logging.info("🔬 MOVEMENT COORDINATE DIAGNOSIS")
     
     # Board info
-    cw = board.w / 10.0
+    cw = board.w / BOARD_COLS
     logging.info(f"   📏 Board: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
     logging.info(f"   📐 Cell width: {cw:.1f} pixels per column")
     
@@ -2451,8 +2483,8 @@ def save_column_debug_image(backend: 'ScreenBackend', board: 'BoardRect', piece_
         overlay = img.copy()
         
         # Dimensiones de celda
-        cw = board.w / 10.0
-        ch = board.h / 20.0
+        cw = board.w / BOARD_COLS
+        ch = board.h / BOARD_ROWS
         
         # Dibujar líneas de columnas
         for col in range(11):  # 0..10 bordes
@@ -2535,8 +2567,8 @@ def validate_screen_coordinates(backend: 'ScreenBackend', board: 'BoardRect') ->
     
     # Validate board coordinates
     screen_width, screen_height = backend.get_resolution()
-    cw = board.w / 10.0
-    ch = board.h / 20.0
+    cw = board.w / BOARD_COLS
+    ch = board.h / BOARD_ROWS
     
     logging.info(f"   📱 Screen: {screen_width}x{screen_height}")
     logging.info(f"   🎮 Board: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
@@ -2696,8 +2728,8 @@ def verify_board_runtime(board: 'BoardRect', piece_cells: List[Tuple[int,int]],
     
     try:
         rows, cols = occ_grid.shape
-        cw = board.w / 10.0
-        ch = board.h / 20.0
+        cw = board.w / BOARD_COLS
+        ch = board.h / BOARD_ROWS
         
         # 1. VERIFICACIÓN DE POSICIÓN DE PIEZA
         if piece_cells:
@@ -2932,13 +2964,13 @@ def evaluate_dependencies(board: np.ndarray, heights: np.ndarray) -> float:
     return penalty
 
 
-def _choose_backend(name: str, serial: Optional[str]) -> ScreenBackend:
+def _choose_backend(name: str, serial: Optional[str], config: TetrisConfig) -> ScreenBackend:
     name = (name or "hybrid").lower()
     if name == "adb":
         return ADBBackend(serial)
     if name == "scrcpy":
-        return ScrcpyBackend(serial)
-    return HybridBackend(serial)  # default
+        return ScrcpyBackend(serial, config=config)
+    return HybridBackend(serial, config=config)  # default
 
 
 def evaluate_surface_flatness(heights: np.ndarray) -> float:
@@ -3414,12 +3446,12 @@ class GestureZones:
     column_centers: List[int]
 
 def compute_gesture_zones(board: BoardRect) -> GestureZones:
-    cw = board.w/10.0; ch = board.h/20.0
+    cw = board.w/BOARD_COLS; ch = board.h/BOARD_ROWS
     rotate_xy   = (int(board.x0 + 8.5*cw), int(board.y0 + 2.0*ch))
     mid_band_y  = int(board.y0 + 9.5*ch)  # banda estable para micro-swipes
     drop_start  = (int(board.x0 + 5.0*cw), int(board.y0 + 2.0*ch))
     drop_end    = (drop_start[0], int(board.y0 + 18.5*ch))
-    centers     = [int(board.x0 + (c+0.5)*cw) for c in range(10)]
+    centers     = [int(board.x0 + (c+0.5)*cw) for c in range(BOARD_COLS)]
     return GestureZones(rotate_xy, mid_band_y, (drop_start, drop_end), centers)
 
 def rotate_action(backend: ScreenBackend, zones: GestureZones, taps:int=1):
@@ -3436,7 +3468,8 @@ def move_piece_to_column(backend: 'ScreenBackend',
                          board: BoardRect,
                          piece_cells: List[Tuple[int,int]],
                          target_col: int,
-                         timing_multiplier: float = 1.0):
+                         timing_multiplier: float = 1.0,
+                         config: TetrisConfig = None):
     """
     Mueve con micro-swipes de ~1 columna cada uno, a una Y estable dentro del tablero.
     NO usa draganddrop en ningún caso.
@@ -3445,7 +3478,7 @@ def move_piece_to_column(backend: 'ScreenBackend',
         return
 
     # Tamaño de celda
-    cw = board.w / 10.0
+    cw = board.w / BOARD_COLS
 
     # Y segura para swipe horizontal (clamp al interior del board)
     y = int(max(board.y0 + board.h * 0.30, min(zones.mid_band_y, board.y0 + board.h * 0.85)))
@@ -3473,7 +3506,8 @@ def move_piece_to_column(backend: 'ScreenBackend',
         x_target = int(board.x0 + (target_col + 0.5) * cw)
         logging.debug(f"➡️ Long swipe: ({x_start},{y}) -> ({x_target},{y}) dur={dur}ms")
         backend.swipe(x_start, y, x_target, y, duration_ms=dur)
-        time.sleep(0.06)
+        delay = (config or TetrisConfig()).get_delay("rotate", 0.06)
+        time.sleep(delay)
         return
     except Exception as e:
         logging.debug(f"Long swipe falló: {e}. Probando micro-swipes...")
@@ -3487,7 +3521,8 @@ def move_piece_to_column(backend: 'ScreenBackend',
         logging.debug(f"➡️ Step {i+1}/{steps}: swipe ({x},{y}) -> ({x_next},{y}) dur={dur}ms")
         backend.swipe(x, y, x_next, y, duration_ms=dur)
         x = x_next
-        time.sleep(0.04)
+        delay = (config or TetrisConfig()).get_delay("swipe_step", 0.04)
+        time.sleep(delay)
 # =========================== Control una-vez-por-pieza ==========================
 
 class PieceTracker:
@@ -3693,11 +3728,9 @@ def main():
             os.makedirs("tetris_debug")
         logging.info("Modo de depuración visual ACTIVADO. Imágenes se guardarán en 'tetris_debug/'")
 
-    if args.backend=="adb": backend=ADBBackend(args.serial)
-    elif args.backend=="scrcpy":
-        if not SCRCPY_DEPS_OK: logging.error("scrcpy backend requiere pyautogui/pygetwindow/mss"); sys.exit(1)
-        backend=ScrcpyBackend(args.serial)
-    else: backend=HybridBackend(args.serial)
+    if args.backend=="scrcpy" and not SCRCPY_DEPS_OK:
+        logging.error("scrcpy backend requiere pyautogui/pygetwindow/mss"); sys.exit(1)
+    backend = _choose_backend(args.backend, args.serial, config)
 
     logging.info(f"Backend solicitado: {args.backend}")
     backend.connect()
@@ -3735,7 +3768,7 @@ def main():
     # Opción de test de movimiento
     if args.test_movement:
         logging.info("🧪 MODO TEST DE MOVIMIENTO - Solo testing, no juego")
-        test_movement_system(backend, board)
+        test_movement_system(backend, board, config)
         logging.info("🏁 Test completado. Saliendo...")
         backend.cleanup()
         return
@@ -3787,21 +3820,21 @@ def main():
             # Validar tamaño del crop periódicamente
             if frame_count % 120 == 0:  # Cada 2 minutos a 60 FPS
                 crop_h, crop_w = crop.shape[:2]
-                expected_cell_h = crop_h / 20.0
-                expected_cell_w = crop_w / 10.0
+                expected_cell_h = crop_h / BOARD_ROWS
+                expected_cell_w = crop_w / BOARD_COLS
                 expansion_pixels = actual_h - board.h
                 logging.info(f"🖼️ Board crop validation: {crop_h}x{crop_w} pixels")
                 logging.info(f"   Expected cell size: {expected_cell_w:.1f}x{expected_cell_h:.1f} pixels")
                 logging.info(f"   Board rectangle: x={board.x0}, y={board.y0}, w={board.w}, h={board.h}")
                 logging.info(f"   Expansion applied: +{expansion_pixels} pixels ({expansion_pixels/expected_cell_h:.1f} rows worth)")
                 
-                # Verificar que el crop tenga suficiente altura para 20 filas
-                min_required_height = 200  # mínimo razonable para 20 filas
+                # Verificar que el crop tenga suficiente altura para el tablero completo
+                min_required_height = 200  # mínimo razonable para BOARD_ROWS filas
                 if crop_h < min_required_height:
-                    logging.warning(f"⚠️ Crop height ({crop_h}) may be too small for 20 rows!")
+                    logging.warning(f"⚠️ Crop height ({crop_h}) may be too small for {BOARD_ROWS} rows!")
 
             # MIGRACIÓN GRADUAL: Usar sistema modular para análisis
-            board_analysis = vision_system.analyze_board(crop, rows=20, cols=10)
+            board_analysis = vision_system.analyze_board(crop, rows=BOARD_ROWS, cols=BOARD_COLS)
             occ = board_analysis.occupancy_grid
             debug_mask = board_analysis.debug_mask
             piece_cells = board_analysis.active_piece
@@ -3860,7 +3893,7 @@ def main():
                         logging.warning(f"Alta ocupación ({occupation_rate:.1%}) pero pieza válida; continuo.")
                     else:
                         logging.error("Estado de juego inválido tras recalibración → salto frame")
-                        time.sleep(0.05)
+                        time.sleep(config.get_delay("short", 0.05))
                         continue
 
             elif occupation_rate < 0.02:
@@ -3924,7 +3957,7 @@ def main():
                     last_wake_t = now
                     if frame_count % 30 == 0:  # log cada 30 frames sin pieza
                         logging.info("Esperando nueva pieza...")
-                time.sleep(0.05)
+                time.sleep(config.get_delay("short", 0.05))
                 # siguiente frame
                 sleep=dt-(time.time()-t0)
                 if sleep>0: time.sleep(sleep)
@@ -3935,7 +3968,7 @@ def main():
             if len(piece_cells) > 4:
                 logging.error(f"❌ REJECTING oversized piece: {len(piece_cells)} cells")
                 logging.error(f"   This should not happen with the fixed vision system!")
-                time.sleep(0.05)
+                time.sleep(config.get_delay("short", 0.05))
                 sleep=dt-(time.time()-t0)
                 if sleep>0: time.sleep(sleep)
                 if session_sec and (time.time()-start)>session_sec: break
@@ -4015,7 +4048,7 @@ def main():
                 for i in range(rotations_needed):
                     logging.debug(f"   Rotation {i+1}/{rotations_needed}")
                     controller_system.rotate_piece()
-                    time.sleep(0.06)  # pausa más larga entre rotaciones
+                    time.sleep(config.get_delay("rotate", 0.06))  # pausa más larga entre rotaciones
                 
                 # Execute movement with built-in retry and verification
                 logging.info("➡️ Executing column movement...")
@@ -4037,7 +4070,7 @@ def main():
                 logging.info("=" * 80)
             else:
                 # Ya actuamos en esta pieza, solo esperar
-                time.sleep(0.05)
+                time.sleep(config.get_delay("short", 0.05))
 
             # ciclo - increment frame counter
             frame_count += 1
@@ -4053,7 +4086,7 @@ def main():
         except Exception: pass
 
 
-def test_movement_system(backend: ScreenBackend, board: BoardRect):
+def test_movement_system(backend: ScreenBackend, board: BoardRect, config: TetrisConfig):
     """
     Función de test MEJORADA para calibración y diagnóstico de movimiento.
     Incluye validaciones, tests comprehensivos y detección de problemas.
@@ -4067,8 +4100,8 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
     
     # Calcular zones
     zones = compute_gesture_zones(board)
-    cw = board.w/10.0
-    ch = board.h/20.0
+    cw = board.w/BOARD_COLS
+    ch = board.h/BOARD_ROWS
     y = zones.mid_band_y
     
     logging.info(f"🎯 Test parameters: y={y}, cell_width={cw:.1f}, cell_height={ch:.1f}")
@@ -4091,7 +4124,7 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
         try:
             backend.swipe(x1, y, x2, y, duration_ms=200)
             logging.info(f"   ✅ {distance}-column right swipe successful")
-            time.sleep(0.8)
+            time.sleep(config.get_delay("long", 0.8))
         except Exception as e:
             logging.error(f"   ❌ {distance}-column right swipe failed: {e}")
     
@@ -4107,7 +4140,7 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
         try:
             backend.swipe(x1, y, x2, y, duration_ms=200)
             logging.info(f"   ✅ {distance}-column left swipe successful")
-            time.sleep(0.8)
+            time.sleep(config.get_delay("long", 0.8))
         except Exception as e:
             logging.error(f"   ❌ {distance}-column left swipe failed: {e}")
             
@@ -4131,7 +4164,7 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
             fake_piece = [(10, start_col), (11, start_col)]  # Simple 2-cell piece
             
             logging.info(f"      Movement test: col {start_col} -> {target_col} ({target_x - start_x:+d}px)")
-            move_piece_to_column(backend, zones, board, fake_piece, target_col)
+            move_piece_to_column(backend, zones, board, fake_piece, target_col, config=config)
             
             test_results['column_precision'][target_col] = True
             logging.info(f"   ✅ Column {target_col} movement completed")
@@ -4140,7 +4173,7 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
             test_results['column_precision'][target_col] = False
             logging.error(f"   ❌ Column {target_col} movement failed: {e}")
             
-        time.sleep(1.0)  # Pause between tests
+        time.sleep(config.get_delay("test_pause", 1.0))  # Pause between tests
         
     # Test 4: Rotation test
     logging.info("🔄 Test 4 - ROTATION TEST")
@@ -4151,7 +4184,7 @@ def test_movement_system(backend: ScreenBackend, board: BoardRect):
         for i in range(4):  # Test 4 rotations
             logging.info(f"   Rotation {i+1}/4")
             backend.tap(rx, ry, hold_ms=80)
-            time.sleep(0.6)
+            time.sleep(config.get_delay("medium", 0.6))
         
         test_results['rotation'] = True
         logging.info("   ✅ Rotation test successful")
