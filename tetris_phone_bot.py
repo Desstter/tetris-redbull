@@ -1160,8 +1160,8 @@ def detect_ghost_component(board_bgr: np.ndarray,
     val_active = _avg_val_of_component(board_bgr, piece_cells, grid_shape)
 
     # umbrales robustos (ajustables)
-    SAT_DELTA_MIN = 12.0   # ghost debe ser bastante menos saturado
-    V_DELTA_MIN   = 8.0    # y un poco más brillante
+    SAT_DELTA_MIN = 8.0    # ghost debe ser menos saturado
+    V_DELTA_MIN   = 5.0    # y un poco más brillante
     MAX_GHOST_SIZE = 6
 
     comps = list_components(occ, max_component_size=12)
@@ -1320,32 +1320,40 @@ def classify_piece(cells: List[Tuple[int,int]])->Optional[Tuple[str,int]]:
     return None
 
 def filter_ghost_pieces(board_bgr: np.ndarray,
+                        occ: np.ndarray,
                         comps: List[List[Tuple[int,int]]],
                         grid_shape: Tuple[int,int]=(20,10)) -> List[List[Tuple[int,int]]]:
     """
     Quita de 'comps' cualquier componente que cumpla las condiciones de ghost
     respecto a la pieza más alta (ancla).
     """
-    if not comps: 
+    if not comps:
         return comps
     # ancla: componente válido más alto (menor r0)
     anchor = min(comps, key=lambda c: bounding_box(c)[0])
     r0a,_,r1a,_ = bounding_box(anchor)
     rows, cols = grid_shape
 
+    # identificar ghost explícitamente usando la ancla
+    ghost_cells = detect_ghost_component(board_bgr, occ, anchor)
+    ghost_set = set(ghost_cells)
+
     # métricas del ancla
     sat_anchor = _avg_sat_of_component(board_bgr, anchor, grid_shape)
     val_anchor = _avg_val_of_component(board_bgr, anchor, grid_shape)
     cols_anchor = set(c for _,c in anchor)
 
-    SAT_DELTA_MIN = 12.0
-    V_DELTA_MIN   = 8.0
+    SAT_DELTA_MIN = 8.0
+    V_DELTA_MIN   = 5.0
 
     out=[]
     removed=0
     for comp in comps:
         if comp is anchor:
             out.append(comp); continue
+        if ghost_set and set(comp).issubset(ghost_set):
+            removed += 1
+            continue
         r0, c0, r1, c1 = bounding_box(comp)
         if r0 <= r1a:
             out.append(comp); continue
@@ -1445,7 +1453,7 @@ def find_active_piece(occ: np.ndarray, board_bgr: np.ndarray=None) -> Optional[L
 
     # 1) eliminar ghost antes de puntuar
     if board_bgr is not None and len(comps) >= 2:
-        comps = filter_ghost_pieces(board_bgr, comps, grid_shape)
+        comps = filter_ghost_pieces(board_bgr, occ, comps, grid_shape)
 
     best=None; best_top=1e9; best_score=-1
     for i, comp in enumerate(comps):
