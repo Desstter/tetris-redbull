@@ -156,6 +156,7 @@ class TetrisVision:
         else:
             piece_cells = raw_piece_cells
 
+
         # Si la pieza incluye al ghost (componente fusionado), separarlos
         piece_cells, merged_ghost = _split_merged_active_and_ghost(piece_cells or [])
         piece_cells = piece_cells or None
