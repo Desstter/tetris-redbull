@@ -156,8 +156,15 @@ class TetrisVision:
         else:
             piece_cells = raw_piece_cells
 
-        # Detección de ghost usando la pieza filtrada
+
+        # Si la pieza incluye al ghost (componente fusionado), separarlos
+        piece_cells, merged_ghost = _split_merged_active_and_ghost(piece_cells or [])
+        piece_cells = piece_cells or None
+
+        # Detección de ghost usando la pieza filtrada/corregida
         ghost_cells = detect_ghost_component(crop, occ, piece_cells) if piece_cells else []
+        if merged_ghost:
+            ghost_cells = list(set(ghost_cells) | set(merged_ghost))
 
         if ghost_cells:
             # Quitar ghost de la grilla de ocupación
@@ -1152,7 +1159,24 @@ def _avg_val_of_component(board_bgr: np.ndarray,
         if patch.size:
             vals.append(float(np.median(patch)))
     return float(np.median(vals)) if vals else 0.0
-    
+
+def _split_merged_active_and_ghost(cells: List[Tuple[int,int]]) -> Tuple[List[Tuple[int,int]], List[Tuple[int,int]]]:
+    """Si `cells` contiene la pieza activa junto con su ghost, separa ambos conjuntos."""
+    if not cells or len(cells) <= 4:
+        return cells, []
+    cells_sorted = sorted(cells)
+    groups = [[cells_sorted[0]]]
+    for r, c in cells_sorted[1:]:
+        if r - groups[-1][-1][0] > 1:
+            groups.append([])
+        groups[-1].append((r, c))
+    if len(groups) == 1:
+        return cells, []
+    groups.sort(key=lambda g: min(r for r, _ in g))
+    active = groups[0]
+    ghost = [cell for g in groups[1:] for cell in g]
+    return active, ghost
+
 def detect_ghost_component(board_bgr: np.ndarray,
                            occ: np.ndarray,
                            piece_cells: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
